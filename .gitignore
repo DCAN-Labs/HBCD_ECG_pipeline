@@ -1,0 +1,5 @@
+bids/*
+old_scripts/*
+output*
+*pycache*
+*.csv
