@@ -26,10 +26,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy the pipeline script
-COPY ecg_pipeline.py .
+COPY HBCD_ECG_pipeline_v4.py .
 
 # Default mount points for data (bind-mount your real folders onto these at `docker run`)
 RUN mkdir -p /data/input /data/output
 
-ENTRYPOINT ["python", "ecg_pipeline.py"]
+ENTRYPOINT ["python", "HBCD_ECG_pipeline_v4.py"]
 CMD []
