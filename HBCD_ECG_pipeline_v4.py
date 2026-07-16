@@ -4,6 +4,7 @@ import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib
 matplotlib.use("Agg")  # no display inside a container
 import neurokit2 as nk
 import mne
@@ -13,27 +14,59 @@ import traceback
 import datetime
 import argparse
 import re
-
-
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="The figure layout has changed to tight"
+)
 
 def parse_command_line_args():
 
     parser = argparse.ArgumentParser(
-        description="Run the HBCD ECG task-based QC pipeline."
+        description="Run the HBCD ECG task-based QC pipeline (BIDS-App)."
+    )
+
+    # ------------------------------------------------------------
+    # BIDS-App required positional arguments
+    # ------------------------------------------------------------
+    parser.add_argument(
+        'bids_dir',
+        help='Path to the BIDS dataset directory'
     )
 
     parser.add_argument(
-        "--input-dir",
-        default=r"Z:\Projects\BillFifer\HBCD\ECG Pipeline\HBCD",
-        help="Folder containing HBCD BIDS-style data. Example: /Users/Lynn/Desktop/ECG Pipeline/HBCD"
+        'output_dir',
+        help='Path to the output directory (will be created if it does not exist)'
     )
 
     parser.add_argument(
-        "--output-dir",
-        default=r"Z:\Projects\BillFifer\HBCD\ECG Pipeline\HBCD_ECG_Pipeline_Output_v4",
-        help="Folder where output plots and summary CSV files will be saved."
+        'analysis_level',
+        choices=['participant_level', 'group_level'],
+        help='Level of analysis to perform'
     )
 
+    # ------------------------------------------------------------
+    # BIDS-App standard optional filters
+    # ------------------------------------------------------------
+    parser.add_argument(
+        '--participant_label',
+        nargs='+',
+        dest='participant_labels',
+        help='Space-separated list of participant labels to analyze (without "sub-" prefix). '
+             'If not provided, all participants will be analyzed.'
+    )
+
+    parser.add_argument(
+        '--session_label',
+        nargs='+',
+        dest='session_labels',
+        help='Space-separated list of session labels to analyze (without "ses-" prefix). '
+             'If not provided, all sessions for each participant will be analyzed.'
+    )
+
+    # ------------------------------------------------------------
+    # Pipeline-specific optional arguments
+    # ------------------------------------------------------------
     parser.add_argument(
         "--tasks",
         nargs="+",
@@ -78,14 +111,21 @@ def parse_command_line_args():
 ARGS = parse_command_line_args()
 
 # Expected input structure:
-#   input-dir/sub-240961/ses-V04/eeg/sub-240961_ses-V04_task-RS_acq-ecg_run-01_eeg.set
-INPUT_DIR = Path(ARGS.input_dir).expanduser().resolve()
+#   bids_dir/sub-240961/ses-V04/eeg/sub-240961_ses-V04_task-RS_acq-ecg_run-01_eeg.set
+INPUT_DIR = Path(ARGS.bids_dir).expanduser().resolve()
 
 
 # Expected output structure:
-#   output-dir/sub-240961/ses-V04/ecg/rs-task/
+#   output_dir/sub-240961/ses-V04/ecg/rs-task/
 OUTPUT_DIR = Path(ARGS.output_dir).expanduser().resolve()
 
+# BIDS-App analysis level ('participant_level' or 'group_level').
+ANALYSIS_LEVEL = ARGS.analysis_level
+
+# Optional participant/session filters (labels WITHOUT the "sub-"/"ses-" prefix).
+# None means "process everything found".
+PARTICIPANT_LABELS = ARGS.participant_labels
+SESSION_LABELS = ARGS.session_labels
 
 TASKS_TO_PROCESS = [task.upper() for task in ARGS.tasks]
 
@@ -129,8 +169,11 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print("\nHBCD ECG pipeline settings")
 print("--------------------------")
-print("Input folder:", INPUT_DIR)
+print("BIDS directory:", INPUT_DIR)
 print("Output folder:", OUTPUT_DIR)
+print("Analysis level:", ANALYSIS_LEVEL)
+print("Participant labels:", PARTICIPANT_LABELS if PARTICIPANT_LABELS else "ALL")
+print("Session labels:", SESSION_LABELS if SESSION_LABELS else "ALL")
 print("Tasks:", TASKS_TO_PROCESS)
 print("Acquisition:", ACQ_TO_PROCESS)
 print("Fallback ECG channel:", FALLBACK_ECG_CHANNEL)
@@ -140,6 +183,15 @@ print("Peak-correction interval_max:", FIXPEAKS_INTERVAL_MAX)
 print("RR percent-change threshold:", RR_PERCENT_CHANGE_THRESHOLD)
 print("QC marker window seconds:", QC_WINDOW_SEC)
 print("--------------------------\n")
+
+# ------------------------------------------------------------
+# This pipeline only implements participant-level analysis.
+# group_level is accepted (for BIDS-App compliance) but not implemented.
+# ------------------------------------------------------------
+if ANALYSIS_LEVEL == "group_level":
+    print("Status: 'group_level' was requested, but this pipeline only implements 'participant_level' analysis.")
+    print("Nothing to do. Exiting.")
+    raise SystemExit(0)
 
 
 # ------------------------------------------------------------
@@ -161,15 +213,43 @@ def simple_title(subject, session, task, suffix):
 
 
 
-def find_task_set_files(input_dir, tasks_to_process, acq_to_process="ecg"):
+def find_task_set_files(input_dir, tasks_to_process, acq_to_process="ecg", participant_labels=None, session_labels=None):
+    """
+    Find task .set files under input_dir, optionally restricted to specific
+    participant labels (without "sub-") and/or session labels (without "ses-").
+    """
+
+    if participant_labels:
+        subject_globs = [f"sub-{label}" for label in participant_labels]
+    else:
+        subject_globs = ["sub-*"]
+
+    if session_labels:
+        session_globs = [f"ses-{label}" for label in session_labels]
+    else:
+        session_globs = ["ses-*"]
+
     all_set_files = []
     for task in tasks_to_process:
-        pattern = f"sub-*/ses-*/eeg/*task-{task}_acq-{acq_to_process}*eeg.set"
-        task_files = list(input_dir.glob(pattern))
-        print(f"Search pattern for task-{task}: {input_dir / pattern}")
+        task_files = []
+        for subject_glob in subject_globs:
+            for session_glob in session_globs:
+                pattern = f"{subject_glob}/{session_glob}/eeg/*task-{task}_acq-{acq_to_process}*eeg.set"
+                task_files.extend(input_dir.glob(pattern))
+
+        print(f"Search pattern(s) for task-{task}: participants={subject_globs}, sessions={session_globs}")
         print(f"Found {len(task_files)} task-{task} acq-{acq_to_process} .set files.\n")
         all_set_files.extend(task_files)
-    return sorted(all_set_files)
+
+    # De-duplicate (e.g. if participant/session globs overlap) while keeping stable order.
+    seen = set()
+    unique_files = []
+    for f in all_set_files:
+        if f not in seen:
+            seen.add(f)
+            unique_files.append(f)
+
+    return sorted(unique_files)
 
 
 
@@ -906,9 +986,19 @@ def nan_summary(arr):
 # ------------------------------------------------------------
 # FIND FILES
 # ------------------------------------------------------------
-file_paths = find_task_set_files(INPUT_DIR, TASKS_TO_PROCESS, ACQ_TO_PROCESS)
+file_paths = find_task_set_files(
+    INPUT_DIR,
+    TASKS_TO_PROCESS,
+    ACQ_TO_PROCESS,
+    participant_labels=PARTICIPANT_LABELS,
+    session_labels=SESSION_LABELS
+)
 if not file_paths:
     print(f"Status: No .set files found in {INPUT_DIR}")
+    if PARTICIPANT_LABELS:
+        print(f"  (filtered to participant labels: {PARTICIPANT_LABELS})")
+    if SESSION_LABELS:
+        print(f"  (filtered to session labels: {SESSION_LABELS})")
     raise SystemExit(1)
 
 total_files = len(file_paths)
@@ -1819,7 +1909,7 @@ for index, file_path in enumerate(file_paths, start=1):
                 raise ValueError("Not enough final clean RR intervals for 4 Hz PSD after bad-segment removal.")
 
             # Use final clean RR intervals.
-            # Convert seconds to milliseconds because HRV PSD is traditionally in ms²/Hz.
+            # Convert seconds to milliseconds because HRV PSD is traditionally in ms².
             rri_ms = rr_final_cleaned.astype(float) * 1000
             rri_time = np.cumsum(rr_final_cleaned)
             interp_rate = 4
