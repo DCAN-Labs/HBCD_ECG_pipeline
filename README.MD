@@ -133,4 +133,4 @@ If processing fails for a file:
 
 ## License
 
-This project is provided as-is for internal HBCD ECG QC processing workflows.
+This project is licensed under the MIT License. See the LICENSE file for details.
