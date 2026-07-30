@@ -1,11 +1,16 @@
 ### ECG Pipeline - HBCD ###
+#
+# Integrated processing order:
+#   1. Automatically identify the most likely ECG channel among E125-E128
+#      using NeuroKit R-peak counts plus the direct correlation matrix.
+#   2. If no channel is selected, log the file and skip all ECG processing.
+#   3. Run the full ECG QC, RR, HR, and HRV pipeline on the selected channel.
+
 
 import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use("Agg")  # no display inside a container
 import neurokit2 as nk
 import mne
 from scipy.signal import welch
@@ -14,59 +19,27 @@ import traceback
 import datetime
 import argparse
 import re
-import warnings
-warnings.filterwarnings(
-    "ignore",
-    message="The figure layout has changed to tight"
-)
+
+
 
 def parse_command_line_args():
 
     parser = argparse.ArgumentParser(
-        description="Run the HBCD ECG task-based QC pipeline (BIDS-App)."
-    )
-
-    # ------------------------------------------------------------
-    # BIDS-App required positional arguments
-    # ------------------------------------------------------------
-    parser.add_argument(
-        'bids_dir',
-        help='Path to the BIDS dataset directory'
+        description="Run the HBCD ECG task-based QC pipeline."
     )
 
     parser.add_argument(
-        'output_dir',
-        help='Path to the output directory (will be created if it does not exist)'
+        "--input-dir",
+        default=r"Z:\Projects\BillFifer\HBCD\ECG Pipeline\HBCD",
+        help="Folder containing HBCD BIDS-style data. Example: /Users/Lynn/Desktop/ECG Pipeline/HBCD"
     )
 
     parser.add_argument(
-        'analysis_level',
-        choices=['participant_level', 'group_level'],
-        help='Level of analysis to perform'
+        "--output-dir",
+        default=r"Z:\Projects\BillFifer\HBCD\ECG Pipeline\HBCD_ECG_Pipeline_Output_v5",
+        help="Folder where output plots and summary CSV files will be saved."
     )
 
-    # ------------------------------------------------------------
-    # BIDS-App standard optional filters
-    # ------------------------------------------------------------
-    parser.add_argument(
-        '--participant_label',
-        nargs='+',
-        dest='participant_labels',
-        help='Space-separated list of participant labels to analyze (without "sub-" prefix). '
-             'If not provided, all participants will be analyzed.'
-    )
-
-    parser.add_argument(
-        '--session_label',
-        nargs='+',
-        dest='session_labels',
-        help='Space-separated list of session labels to analyze (without "ses-" prefix). '
-             'If not provided, all sessions for each participant will be analyzed.'
-    )
-
-    # ------------------------------------------------------------
-    # Pipeline-specific optional arguments
-    # ------------------------------------------------------------
     parser.add_argument(
         "--tasks",
         nargs="+",
@@ -83,7 +56,11 @@ def parse_command_line_args():
     parser.add_argument(
         "--fallback-ecg-channel",
         default="E128",
-        help="Backup ECG channel if channels.tsv does not explicitly label ECG/EKG."
+        help=(
+            "Retained only for backward command-line compatibility. "
+            "The integrated pipeline now identifies ECG automatically from "
+            "E125-E128 and does not hard-code this fallback."
+        )
     )
 
     parser.add_argument(
@@ -111,28 +88,30 @@ def parse_command_line_args():
 ARGS = parse_command_line_args()
 
 # Expected input structure:
-#   bids_dir/sub-240961/ses-V04/eeg/sub-240961_ses-V04_task-RS_acq-ecg_run-01_eeg.set
-INPUT_DIR = Path(ARGS.bids_dir).expanduser().resolve()
+#   input-dir/sub-123/ses-V04/eeg/sub-123_ses-V04_task-RS_acq-ecg_run-01_eeg.set
+INPUT_DIR = Path(ARGS.input_dir).expanduser().resolve()
 
 
 # Expected output structure:
-#   output_dir/sub-240961/ses-V04/ecg/rs-task/
+#   output-dir/sub-123/ses-V04/ecg/rs-task/
 OUTPUT_DIR = Path(ARGS.output_dir).expanduser().resolve()
 
-# BIDS-App analysis level ('participant_level' or 'group_level').
-ANALYSIS_LEVEL = ARGS.analysis_level
-
-# Optional participant/session filters (labels WITHOUT the "sub-"/"ses-" prefix).
-# None means "process everything found".
-PARTICIPANT_LABELS = ARGS.participant_labels
-SESSION_LABELS = ARGS.session_labels
 
 TASKS_TO_PROCESS = [task.upper() for task in ARGS.tasks]
 
 ACQ_TO_PROCESS = ARGS.acq
 
-# If channels.tsv does not correctly label an ECG channel, use this as a backup.
-FALLBACK_ECG_CHANNEL = ARGS.fallback_ecg_channel
+# Candidate channels evaluated automatically before ECG processing.
+ECG_CANDIDATE_CHANNELS = ["E125", "E126", "E127", "E128"]
+
+# Correlation thresholds for automatic ECG channel selection:
+# - The non-ECG peer channels should correlate strongly with one another.
+# - A possible ECG channel should correlate less strongly with every peer.
+PEER_CHANNEL_MIN_CORR = 0.95
+ECG_CANDIDATE_MAX_CORR = 0.90
+
+# NeuroKit plausibility rule. Minimum R-peak count for channel selection.
+MIN_RPEAK_COUNT_FOR_CHANNEL_SELECTION = 30
 
 
 DEFAULT_SAMPLING_RATE = 1000
@@ -143,13 +122,13 @@ QUALITY_THRESHOLD = ARGS.quality_threshold
 # PEAK CORRECTION / BAD-SEGMENT SETTINGS
 # ------------------------------------------------------------
 #
-# 1. Peak correction uses an expected RR interval range:
+# 1. Bad segments are identified using:
+#       abs(RR[n] - RR[n-1]) / RR[n] >= 0.20
+# 
+# 2.  After bad segments removal, Peak correction uses an expected RR interval range:
 #       interval_min = 0.30 seconds
 #       interval_max = 0.75 seconds
-#
-# 2. After peak correction, bad segments are identified using:
-#       abs(RR[n] - RR[n-1]) / RR[n] >= 0.20
-#
+
 FIXPEAKS_INTERVAL_MIN = 0.30
 FIXPEAKS_INTERVAL_MAX = 0.75
 RR_PERCENT_CHANGE_THRESHOLD = 0.20
@@ -169,29 +148,23 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 print("\nHBCD ECG pipeline settings")
 print("--------------------------")
-print("BIDS directory:", INPUT_DIR)
+print("Input folder:", INPUT_DIR)
 print("Output folder:", OUTPUT_DIR)
-print("Analysis level:", ANALYSIS_LEVEL)
-print("Participant labels:", PARTICIPANT_LABELS if PARTICIPANT_LABELS else "ALL")
-print("Session labels:", SESSION_LABELS if SESSION_LABELS else "ALL")
 print("Tasks:", TASKS_TO_PROCESS)
 print("Acquisition:", ACQ_TO_PROCESS)
-print("Fallback ECG channel:", FALLBACK_ECG_CHANNEL)
+print("Automatic ECG candidates:", ECG_CANDIDATE_CHANNELS)
+print(
+    "Minimum R-peak count for channel selection:",
+    MIN_RPEAK_COUNT_FOR_CHANNEL_SELECTION
+)
+print("Peer-channel minimum correlation:", PEER_CHANNEL_MIN_CORR)
+print("ECG-candidate maximum correlation:", ECG_CANDIDATE_MAX_CORR)
 print("Quality threshold:", QUALITY_THRESHOLD)
 print("Peak-correction interval_min:", FIXPEAKS_INTERVAL_MIN)
 print("Peak-correction interval_max:", FIXPEAKS_INTERVAL_MAX)
 print("RR percent-change threshold:", RR_PERCENT_CHANGE_THRESHOLD)
 print("QC marker window seconds:", QC_WINDOW_SEC)
 print("--------------------------\n")
-
-# ------------------------------------------------------------
-# This pipeline only implements participant-level analysis.
-# group_level is accepted (for BIDS-App compliance) but not implemented.
-# ------------------------------------------------------------
-if ANALYSIS_LEVEL == "group_level":
-    print("Status: 'group_level' was requested, but this pipeline only implements 'participant_level' analysis.")
-    print("Nothing to do. Exiting.")
-    raise SystemExit(0)
 
 
 # ------------------------------------------------------------
@@ -213,43 +186,15 @@ def simple_title(subject, session, task, suffix):
 
 
 
-def find_task_set_files(input_dir, tasks_to_process, acq_to_process="ecg", participant_labels=None, session_labels=None):
-    """
-    Find task .set files under input_dir, optionally restricted to specific
-    participant labels (without "sub-") and/or session labels (without "ses-").
-    """
-
-    if participant_labels:
-        subject_globs = [f"sub-{label}" for label in participant_labels]
-    else:
-        subject_globs = ["sub-*"]
-
-    if session_labels:
-        session_globs = [f"ses-{label}" for label in session_labels]
-    else:
-        session_globs = ["ses-*"]
-
+def find_task_set_files(input_dir, tasks_to_process, acq_to_process="ecg"):
     all_set_files = []
     for task in tasks_to_process:
-        task_files = []
-        for subject_glob in subject_globs:
-            for session_glob in session_globs:
-                pattern = f"{subject_glob}/{session_glob}/eeg/*task-{task}_acq-{acq_to_process}*eeg.set"
-                task_files.extend(input_dir.glob(pattern))
-
-        print(f"Search pattern(s) for task-{task}: participants={subject_globs}, sessions={session_globs}")
+        pattern = f"sub-*/ses-*/eeg/*task-{task}_acq-{acq_to_process}*eeg.set"
+        task_files = list(input_dir.glob(pattern))
+        print(f"Search pattern for task-{task}: {input_dir / pattern}")
         print(f"Found {len(task_files)} task-{task} acq-{acq_to_process} .set files.\n")
         all_set_files.extend(task_files)
-
-    # De-duplicate (e.g. if participant/session globs overlap) while keeping stable order.
-    seen = set()
-    unique_files = []
-    for f in all_set_files:
-        if f not in seen:
-            seen.add(f)
-            unique_files.append(f)
-
-    return sorted(unique_files)
+    return sorted(all_set_files)
 
 
 
@@ -263,34 +208,345 @@ def get_matching_sidecars(set_file):
 
 
 
-def get_ecg_channel_from_channels_tsv(channels_tsv, fallback_channel="E128"):
-    channels = pd.read_csv(channels_tsv, sep="\t")
-    channels.columns = channels.columns.str.strip()
-    for col in channels.columns:
-        if channels[col].dtype == "object":
-            channels[col] = channels[col].astype(str).str.strip()
+def identify_ecg_by_rpeak_count(
+    raw,
+    available_channels,
+    sampling_rate
+):
+    """
+    Evaluate E125-E128 with NeuroKit and retain a channel only when there is
+    exactly one viable channel with the highest detected R-peak count.
 
-    if "name" not in channels.columns:
-        raise ValueError(f"No 'name' column found in {channels_tsv}")
+    """
+    channel_stats = {}
 
-    if "type" in channels.columns:
-        type_clean = channels["type"].astype(str).str.upper().str.strip()
-        ecg_rows = channels[type_clean.isin(["ECG", "EKG"])]
-        if not ecg_rows.empty:
-            return ecg_rows["name"].iloc[0], "channels.tsv type column"
+    for channel in available_channels:
+        signal = raw.get_data(picks=[channel])[0].astype(float).flatten()
 
-    if fallback_channel in channels["name"].values:
-        return fallback_channel, f"fallback_{fallback_channel}_no_ECG_type_in_channels_tsv"
+        try:
+            cleaned = nk.ecg_clean(
+                signal,
+                sampling_rate=sampling_rate
+            )
+            peaks = nk.ecg_findpeaks(
+                cleaned,
+                sampling_rate=sampling_rate
+            )["ECG_R_Peaks"]
+            peaks = np.asarray(peaks, dtype=int)
 
-    raise ValueError(
-        f"No ECG/EKG channel found and fallback channel {fallback_channel} not available in {channels_tsv}. "
-        f"Available channels: {channels['name'].tolist()}"
+            channel_stats[channel] = {
+                "event_count": int(len(peaks)),
+                "is_viable": bool(
+                    len(peaks) >= MIN_RPEAK_COUNT_FOR_CHANNEL_SELECTION
+                ),
+                "processing_error": ""
+            }
+
+        except Exception as exc:
+            channel_stats[channel] = {
+                "event_count": 0,
+                "is_viable": False,
+                "processing_error": str(exc)
+            }
+
+    viable = {
+        channel: stats
+        for channel, stats in channel_stats.items()
+        if stats["is_viable"]
+    }
+
+    best_channel = None
+    tied_channels = []
+
+    if viable:
+        maximum_count = max(
+            stats["event_count"]
+            for stats in viable.values()
+        )
+        tied_channels = [
+            channel
+            for channel, stats in viable.items()
+            if stats["event_count"] == maximum_count
+        ]
+
+        if len(tied_channels) == 1:
+            best_channel = tied_channels[0]
+
+    return best_channel, channel_stats, tied_channels
+
+
+def identify_ecg_by_correlation_matrix(
+    raw,
+    available_channels
+):
+    """
+    Compare the pairwise Pearson correlation matrix directly.
+
+    """
+    data = {
+        channel: raw.get_data(picks=[channel])[0].astype(float).flatten()
+        for channel in available_channels
+    }
+    data_df = pd.DataFrame(data)
+    corr_matrix = data_df.corr()
+
+    upper_triangle = corr_matrix.values[
+        np.triu_indices(len(available_channels), k=1)
+    ]
+    finite_pairs = upper_triangle[np.isfinite(upper_triangle)]
+
+    all_channels_highly_similar = bool(
+        len(finite_pairs) > 0
+        and np.all(finite_pairs >= PEER_CHANNEL_MIN_CORR)
     )
+
+    candidates = []
+
+    for candidate in available_channels:
+        peers = [
+            channel
+            for channel in available_channels
+            if channel != candidate
+        ]
+
+        if len(peers) < 2:
+            continue
+
+        candidate_correlations = np.asarray(
+            [
+                corr_matrix.loc[candidate, peer]
+                for peer in peers
+            ],
+            dtype=float
+        )
+
+        peer_pair_correlations = []
+        for i in range(len(peers)):
+            for j in range(i + 1, len(peers)):
+                peer_pair_correlations.append(
+                    corr_matrix.loc[peers[i], peers[j]]
+                )
+        peer_pair_correlations = np.asarray(
+            peer_pair_correlations,
+            dtype=float
+        )
+
+        peers_are_similar = bool(
+            len(peer_pair_correlations) > 0
+            and np.all(np.isfinite(peer_pair_correlations))
+            and np.all(
+                peer_pair_correlations >= PEER_CHANNEL_MIN_CORR
+            )
+        )
+
+        candidate_differs_from_every_peer = bool(
+            len(candidate_correlations) > 0
+            and np.all(np.isfinite(candidate_correlations))
+            and np.all(
+                candidate_correlations <= ECG_CANDIDATE_MAX_CORR
+            )
+        )
+
+        if peers_are_similar and candidate_differs_from_every_peer:
+            candidates.append(candidate)
+
+    best_channel = candidates[0] if len(candidates) == 1 else None
+
+    return (
+        best_channel,
+        corr_matrix,
+        candidates,
+        all_channels_highly_similar
+    )
+
+
+def select_most_likely_ecg_channel(raw):
+    """
+    Combine NeuroKit R-peak evidence and direct correlation-matrix evidence.
+
+    """
+    available_channels = [
+        channel
+        for channel in ECG_CANDIDATE_CHANNELS
+        if channel in raw.ch_names
+    ]
+
+    details = {
+        "available_channels": available_channels,
+        "best_neurokit": None,
+        "neurokit_tied_channels": [],
+        "best_correlation": None,
+        "correlation_candidates": [],
+        "all_channels_highly_similar": False,
+        "rpeak_counts": {}
+    }
+
+    if len(available_channels) < 2:
+        return (
+            None,
+            "no_ecg_selected_fewer_than_two_candidate_channels",
+            details
+        )
+
+    sampling_rate = float(raw.info["sfreq"])
+
+    (
+        best_neurokit,
+        channel_stats,
+        neurokit_tied_channels
+    ) = identify_ecg_by_rpeak_count(
+        raw,
+        available_channels,
+        sampling_rate
+    )
+
+    (
+        best_correlation,
+        _corr_matrix,
+        correlation_candidates,
+        all_channels_highly_similar
+    ) = identify_ecg_by_correlation_matrix(
+        raw,
+        available_channels
+    )
+
+    details.update({
+        "best_neurokit": best_neurokit,
+        "neurokit_tied_channels": neurokit_tied_channels,
+        "best_correlation": best_correlation,
+        "correlation_candidates": correlation_candidates,
+        "all_channels_highly_similar": all_channels_highly_similar,
+        "rpeak_counts": {
+            channel: stats.get("event_count", 0)
+            for channel, stats in channel_stats.items()
+        }
+    })
+
+    # Strong no-ECG case: all candidate channels are nearly identical.
+    if all_channels_highly_similar:
+        return (
+            None,
+            "no_ecg_selected_all_candidate_channels_highly_similar",
+            details
+        )
+
+    # Strongest automatic decision: both methods identify the same channel.
+    if (
+        best_neurokit is not None
+        and best_correlation is not None
+        and best_neurokit == best_correlation
+    ):
+        return (
+            best_neurokit,
+            "automatic_ecg_selection_methods_agree",
+            details
+        )
+
+    # Correlation matrix found a unique candidate and NeuroKit confirms that
+    # the same channel has enough plausible R-peaks, even when the peak-count
+    # ranking itself is tied or not unique.
+    if best_correlation is not None:
+        correlation_candidate_is_viable = bool(
+            channel_stats
+            .get(best_correlation, {})
+            .get("is_viable", False)
+        )
+
+        if correlation_candidate_is_viable:
+            return (
+                best_correlation,
+                "automatic_ecg_selection_correlation_candidate_neurokit_viable",
+                details
+            )
+
+    # NeuroKit-only decisions are retained as tentative, but only when its
+    # maximum R-peak count is unique.
+    if best_neurokit is not None and best_correlation is None:
+        return (
+            best_neurokit,
+            "tentative_ecg_selection_unique_neurokit_winner",
+            details
+        )
+
+    if (
+        best_neurokit is not None
+        and best_correlation is not None
+        and best_neurokit != best_correlation
+    ):
+        return (
+            None,
+            "no_ecg_selected_methods_disagree",
+            details
+        )
+
+    if len(correlation_candidates) > 1:
+        return (
+            None,
+            "no_ecg_selected_multiple_correlation_candidates",
+            details
+        )
+
+    return (
+        None,
+        "no_ecg_selected_no_channel_stands_out",
+        details
+    )
+
+
+def append_no_ecg_skip_log(
+    output_dir,
+    file_path,
+    subject,
+    session,
+    task,
+    decision,
+    details
+):
+    """
+    Append a text-only record when a file is skipped because no ECG channel
+    was selected. 
+    """
+    log_path = Path(output_dir) / "skipped_no_ecg_channel_log.txt"
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(log_path, "a", encoding="utf-8") as log:
+        log.write("=" * 80 + "\n")
+        log.write(f"TIMESTAMP: {timestamp}\n")
+        log.write(f"FILE: {file_path}\n")
+        log.write(f"SUBJECT: {subject}\n")
+        log.write(f"SESSION: {session}\n")
+        log.write(f"TASK: {task}\n")
+        log.write(f"DECISION: {decision}\n")
+        log.write(
+            "AVAILABLE CHANNELS: "
+            + ";".join(details.get("available_channels", []))
+            + "\n"
+        )
+        log.write(
+            "R-PEAK COUNTS: "
+            + str(details.get("rpeak_counts", {}))
+            + "\n"
+        )
+        log.write(
+            "NEUROKIT TIED CHANNELS: "
+            + ";".join(details.get("neurokit_tied_channels", []))
+            + "\n"
+        )
+        log.write(
+            "CORRELATION CANDIDATES: "
+            + ";".join(details.get("correlation_candidates", []))
+            + "\n"
+        )
+        log.write(
+            "ALL CHANNELS HIGHLY SIMILAR: "
+            + str(details.get("all_channels_highly_similar", False))
+            + "\n\n"
+        )
 
 
 
 def make_output_folder(output_dir, set_file, task):
-    """Save under ecg folder, not eeg."""
+
     set_file = Path(set_file)
     parts = set_file.parts
     subject = next(part for part in parts if part.startswith("sub-"))
@@ -319,7 +575,6 @@ def finalize_and_save(fig, output_path):
     plt.close(fig)
 
 def figure_has_content(fig):
-    """Return True if a Matplotlib figure has axes or visible content."""
     return fig is not None and len(fig.get_axes()) > 0
 
 
@@ -394,7 +649,7 @@ def get_task_start_end_markers(events_df):
 
 def make_task_relative_events(events_df, task_start_sec, task_end_sec):
     """
-    Keep only events inside the task window and reset onset so task_start_sec becomes 0.
+    Keep only events inside the task window.
 
     Example:
     - Full recording bas+ onset = 8.923 seconds
@@ -434,8 +689,7 @@ def plot_first_n_seconds_after_task_start(signal, sampling_rate, n_seconds, subj
     """
     Plot the first n_seconds of the cropped task signal.
 
-    Because the ECG was already cropped to bas+ -> TRSP, time 0 means bas+.
-    So this plot shows the first n_seconds after bas+.
+    This plot shows the first n_seconds after bas+.
     """
     n = len(signal)
     end_sec = min(float(n_seconds), n / sampling_rate)
@@ -660,14 +914,13 @@ def apply_20percent_rr_change_filter(peaks, sampling_rate, threshold=0.20):
     """
     Flag an RR interval when the change from the previous RR interval is at least 20%.
 
-    Formula requested by the team:
+    Formula:
         abs(RR[n] - RR[n-1]) / RR[n] >= threshold
 
     Notes:
     - RR[n] is the current RR interval.
     - RR[n-1] is the previous RR interval.
     - Absolute value flags both sudden increases and sudden decreases.
-    - The first RR interval cannot be evaluated because it has no previous RR.
     """
     peaks = np.asarray(peaks, dtype=int)
 
@@ -794,6 +1047,112 @@ def make_bad_segments_from_20percent_rr(
         })
 
     return merge_bad_segments(bad_segments)
+
+
+def apply_fixpeaks_within_good_segments(
+    peaks,
+    bad_segments,
+    sampling_rate,
+    signal_length,
+    interval_min,
+    interval_max
+):
+    """
+    Run signal_fixpeaks separately within each good ECG section.
+
+    This prevents interval_max from inserting evenly spaced peaks across a
+    bad segment already removed by the 20% RR-change rule.
+    """
+    peaks = np.asarray(peaks, dtype=int)
+
+    if len(peaks) == 0:
+        return np.array([], dtype=int), {
+            "inserted_peaks": np.array([], dtype=int),
+            "removed_peaks": np.array([], dtype=int)
+        }
+
+    sorted_bad = sorted(bad_segments, key=lambda seg: seg["start_sample"])
+    good_ranges = []
+    current_start = 0
+
+    for seg in sorted_bad:
+        bad_start = int(max(0, seg["start_sample"]))
+        bad_end = int(min(signal_length, seg["end_sample"]))
+
+        if bad_start > current_start:
+            good_ranges.append((current_start, bad_start))
+
+        current_start = max(current_start, bad_end)
+
+    if current_start < signal_length:
+        good_ranges.append((current_start, signal_length))
+
+    corrected_all = []
+    inserted_all = []
+    removed_all = []
+
+    for good_start, good_end in good_ranges:
+        segment_peaks = peaks[
+            (peaks >= good_start) & (peaks < good_end)
+        ]
+
+        if len(segment_peaks) < 3:
+            corrected_all.extend(segment_peaks.tolist())
+            continue
+
+        relative_peaks = segment_peaks - good_start
+
+        try:
+            info_segment, corrected_relative = nk.signal_fixpeaks(
+                relative_peaks,
+                sampling_rate=sampling_rate,
+                method="neurokit",
+                iterative=True,
+                interval_min=interval_min,
+                interval_max=interval_max,
+                show=False
+            )
+
+            corrected_relative = np.asarray(corrected_relative, dtype=int)
+            corrected_absolute = corrected_relative + good_start
+            corrected_absolute = corrected_absolute[
+                (corrected_absolute >= good_start)
+                & (corrected_absolute < good_end)
+            ]
+
+            corrected_all.extend(corrected_absolute.tolist())
+
+            inserted = np.asarray(info_segment.get("missed", []), dtype=int)
+            removed = np.asarray(info_segment.get("extra", []), dtype=int)
+
+            if len(inserted):
+                inserted_all.extend((inserted + good_start).tolist())
+            if len(removed):
+                removed_all.extend((removed + good_start).tolist())
+
+        except Exception as exc:
+            print(
+                f"WARNING: signal_fixpeaks failed in good segment "
+                f"{good_start/sampling_rate:.3f}-"
+                f"{good_end/sampling_rate:.3f}s; retaining input peaks. "
+                f"Error: {exc}"
+            )
+            corrected_all.extend(segment_peaks.tolist())
+
+    corrected_all = np.asarray(sorted(set(corrected_all)), dtype=int)
+
+    # Final protection against peaks being placed back inside removed gaps.
+    corrected_all = remove_peaks_in_bad_segments(
+        corrected_all,
+        bad_segments,
+        sampling_rate
+    )
+
+    return corrected_all, {
+        "inserted_peaks": np.asarray(sorted(set(inserted_all)), dtype=int),
+        "removed_peaks": np.asarray(sorted(set(removed_all)), dtype=int)
+    }
+
 
 def remove_peaks_in_bad_segments(peaks, bad_segments, sampling_rate):
     """
@@ -986,19 +1345,9 @@ def nan_summary(arr):
 # ------------------------------------------------------------
 # FIND FILES
 # ------------------------------------------------------------
-file_paths = find_task_set_files(
-    INPUT_DIR,
-    TASKS_TO_PROCESS,
-    ACQ_TO_PROCESS,
-    participant_labels=PARTICIPANT_LABELS,
-    session_labels=SESSION_LABELS
-)
+file_paths = find_task_set_files(INPUT_DIR, TASKS_TO_PROCESS, ACQ_TO_PROCESS)
 if not file_paths:
     print(f"Status: No .set files found in {INPUT_DIR}")
-    if PARTICIPANT_LABELS:
-        print(f"  (filtered to participant labels: {PARTICIPANT_LABELS})")
-    if SESSION_LABELS:
-        print(f"  (filtered to session labels: {SESSION_LABELS})")
     raise SystemExit(1)
 
 total_files = len(file_paths)
@@ -1022,15 +1371,57 @@ for index, file_path in enumerate(file_paths, start=1):
         print(f"Saving outputs to: {output_folder}")
 
         channels_tsv, events_tsv = get_matching_sidecars(file_path)
-        ecg_channel, ecg_channel_source = get_ecg_channel_from_channels_tsv(channels_tsv, FALLBACK_ECG_CHANNEL)
-        print(f"Using ECG channel: {ecg_channel}")
-        print(f"ECG channel source: {ecg_channel_source}")
+
+        # E125-E128, and only then run the ECG processing pipeline.
+        raw = mne.io.read_raw_eeglab(
+            file_path,
+            preload=True,
+            verbose="ERROR"
+        )
+
+        (
+            ecg_channel,
+            ecg_channel_source,
+            ecg_selection_details
+        ) = select_most_likely_ecg_channel(raw)
+
+        if ecg_channel is None:
+            print("No ECG channel selected. Skipping this file.")
+            print("Selection decision:", ecg_channel_source)
+            print(
+                "Available candidate channels:",
+                ecg_selection_details.get("available_channels", [])
+            )
+            print(
+                "Detected R-peak counts:",
+                ecg_selection_details.get("rpeak_counts", {})
+            )
+
+            append_no_ecg_skip_log(
+                output_dir=OUTPUT_DIR,
+                file_path=file_path,
+                subject=subject,
+                session=session,
+                task=task,
+                decision=ecg_channel_source,
+                details=ecg_selection_details
+            )
+
+            plt.close("all")
+            continue
+
+        print(f"Using automatically selected ECG channel: {ecg_channel}")
+        print(f"ECG channel selection decision: {ecg_channel_source}")
+        print(
+            "Candidate-channel R-peak counts:",
+            ecg_selection_details.get("rpeak_counts", {})
+        )
 
         events_df = read_events_file(events_tsv)
         marker_start_sec, marker_end_sec, marker_start_label, marker_end_label = get_task_start_end_markers(events_df)
 
 
-        ########################## July 13, 2026 / Define bgin marker #############################
+        ########################## Define bgin marker #############################
         bgin_events = events_df[events_df['trial_type'] == 'bgin'] if events_df is not None else []
         if len(bgin_events) >= 2:
             bgin_marker_sec = float(bgin_events['onset'].values[1]) # Grabs the second bgin variable
@@ -1064,11 +1455,17 @@ for index, file_path in enumerate(file_paths, start=1):
         if marker_end_sec is not None:
             print(f"End marker: {marker_end_label} @ {marker_end_sec:.3f}s")
 
-        raw = mne.io.read_raw_eeglab(file_path, preload=True)
-        sampling_rate = int(raw.info["sfreq"]) if raw.info.get("sfreq") else DEFAULT_SAMPLING_RATE
+        sampling_rate = (
+            int(raw.info["sfreq"])
+            if raw.info.get("sfreq")
+            else DEFAULT_SAMPLING_RATE
+        )
 
         if ecg_channel not in raw.ch_names:
-            raise ValueError(f"ECG channel {ecg_channel} not found in .set file. Available channels: {raw.ch_names}")
+            raise ValueError(
+                f"Automatically selected ECG channel {ecg_channel} was not "
+                f"found in the .set file. Available channels: {raw.ch_names}"
+            )
 
         # Pull the ECG channel from the .set file.
         ecg_raw_full = raw.get_data(picks=[ecg_channel])[0].flatten()
@@ -1326,26 +1723,7 @@ for index, file_path in enumerate(file_paths, start=1):
         ax.set_ylim(0, 2)
         finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_rr_intervals.png"))
 
-        # 9. Peak correction with signal_fixpeaks
-        # RR interval limits are applied during peak correction before 20% relative-change rule.
-        try:
-            info_fix, peaks_cleaned = nk.signal_fixpeaks(
-                original_peaks,
-                sampling_rate=sampling_rate,
-                method="neurokit",
-                iterative=True,
-                interval_min=FIXPEAKS_INTERVAL_MIN,
-                interval_max=FIXPEAKS_INTERVAL_MAX,
-                show=False
-            )
-        except Exception as e:
-            peaks_cleaned = original_peaks
-            info_fix = {}
-            print(f"WARNING: signal_fixpeaks failed; using original peaks. Error: {e}")
-
-        peaks_cleaned = np.asarray(peaks_cleaned, dtype=int)
-
-        # 9b. RR intervals from cleaned peaks + 20% relative-change rule
+        # 9. FIRST: apply the 20% RR-change rule to ORIGINAL detected peaks.
         (
             rr_raw,
             rr_cleaned_20pct,
@@ -1354,7 +1732,7 @@ for index, file_path in enumerate(file_paths, start=1):
             rr_percent_change,
             rr20_metrics
         ) = apply_20percent_rr_change_filter(
-            peaks_cleaned,
+            original_peaks,
             sampling_rate=sampling_rate,
             threshold=RR_PERCENT_CHANGE_THRESHOLD
         )
@@ -1366,153 +1744,514 @@ for index, file_path in enumerate(file_paths, start=1):
         std_rri = rr20_metrics["std_rri_20percent_cleaned"]
 
         print(
-            f"Number of RR intervals after cleaning: {beats_removed} intervals "
-            f"violated the {RR_PERCENT_CHANGE_THRESHOLD:.0%} change rule. "
-            f"Remaining intervals: {len(rr_cleaned_20pct)}"
+            f"20% rule applied first: {beats_removed} RR intervals flagged. "
+            f"Unflagged intervals: {len(rr_cleaned_20pct)}"
         )
 
-        # Save one row per RR interval so the rule can be audited later.
         if len(rr_raw) > 0:
             percent_change_full = np.full(len(rr_raw), np.nan)
             if len(rr_percent_change) > 0:
                 percent_change_full[1:] = rr_percent_change
 
-            rr20_table = pd.DataFrame({
-                "rr_index": np.arange(len(rr_raw)),
-                "rr_interval_sec": rr_raw,
-                "percent_change_from_previous_rr": percent_change_full,
-                "kept_after_20percent_rule": rr_valid_mask_20pct
-            })
-            rr20_table.to_csv(
-                os.path.join(
-                    output_folder,
-                    f"{title_base}_rr_20percent_change_filter.csv"
-                ),
-                index=False
-            )
 
-        # 9c. Convert RR intervals flagged by the 20% rule into bad ECG segments.
+        # 9b. Convert 20%-flagged original RR intervals into bad segments.
         bad_segments = make_bad_segments_from_20percent_rr(
-            peaks=peaks_cleaned,
+            peaks=original_peaks,
             invalid_rr_indices=invalid_indices,
             sampling_rate=sampling_rate,
             signal_length=len(ecg_filtered),
             padding_sec=BAD_SEGMENT_PADDING_SEC
         )
 
-        bad_segments_df = pd.DataFrame(bad_segments)
-        bad_segments_df.to_csv(
-            os.path.join(
-                output_folder,
-                f"{title_base}_bad_segments_20percent.csv"
-            ),
-            index=False
-        )
 
-        peaks_final = remove_peaks_in_bad_segments(
-            peaks_cleaned,
+        # Remove peaks in those bad segments before interval correction.
+        peaks_after_20pct_removal = remove_peaks_in_bad_segments(
+            original_peaks,
             bad_segments,
             sampling_rate
         )
 
-        rr_all_after_gap_mask, rr_times_all_after_gap_mask, rr_gap_valid_mask, rr_final_cleaned, rr_final_times = rr_intervals_excluding_bad_segments(
+        # 9c. SECOND: apply 0.30-0.75 s interval correction separately inside
+        # each good segment so removed gaps are not repopulated with peaks.
+        peaks_cleaned, info_fix = apply_fixpeaks_within_good_segments(
+            peaks=peaks_after_20pct_removal,
+            bad_segments=bad_segments,
+            sampling_rate=sampling_rate,
+            signal_length=len(ecg_filtered),
+            interval_min=FIXPEAKS_INTERVAL_MIN,
+            interval_max=FIXPEAKS_INTERVAL_MAX
+        )
+
+        peaks_final = peaks_cleaned
+
+        inserted_by_fixpeaks = np.asarray(
+            info_fix.get("inserted_peaks", []),
+            dtype=int
+        )
+        removed_by_fixpeaks = np.asarray(
+            info_fix.get("removed_peaks", []),
+            dtype=int
+        )
+
+        (
+            rr_all_after_gap_mask,
+            rr_times_all_after_gap_mask,
+            rr_gap_valid_mask,
+            rr_final_cleaned,
+            rr_final_times
+        ) = rr_intervals_excluding_bad_segments(
             peaks=peaks_final,
             bad_segments=bad_segments,
             sampling_rate=sampling_rate,
             max_rr_sec=MAX_RR_FOR_INTERPOLATION
         )
 
-        peaks_for_hrv = build_pseudo_peaks_from_rr(rr_final_cleaned, sampling_rate)
+        peaks_for_hrv = build_pseudo_peaks_from_rr(
+            rr_final_cleaned,
+            sampling_rate
+        )
 
-        if len(rr_all_after_gap_mask) > 0:
-            rr_gap_table = pd.DataFrame({
-                "rr_index": np.arange(len(rr_all_after_gap_mask)),
-                "rr_time_sec": rr_times_all_after_gap_mask,
-                "rr_interval_sec": rr_all_after_gap_mask,
-                "kept_after_gap_mask": rr_gap_valid_mask
-            })
-            rr_gap_table.to_csv(
-                os.path.join(output_folder, f"{title_base}_rr_gap_mask.csv"),
-                index=False
-            )
 
-        print(f"Bad ECG segments detected from 20% RR-change rule: {len(bad_segments)}")
-        print(f"Peaks after peak correction: {len(peaks_cleaned)}")
-        print(f"Peaks after bad-segment removal: {len(peaks_final)}")
+        print(f"Bad segments from 20% rule: {len(bad_segments)}")
+        print(f"Original detected peaks: {len(original_peaks)}")
+        print(f"Peaks after 20% bad-segment removal: {len(peaks_after_20pct_removal)}")
+        print(f"Peaks inserted by interval correction: {len(inserted_by_fixpeaks)}")
+        print(f"Peaks removed by interval correction: {len(removed_by_fixpeaks)}")
+        print(f"Final peaks: {len(peaks_final)}")
         print(f"Final RR intervals used for HR/HRV: {len(rr_final_cleaned)}")
 
+        # 10. Separate peak-correction and RR-processing diagnostic figures.
         try:
-            fig, axes = plt.subplots(3, 1, figsize=(14, 10), constrained_layout=True)
-
             if len(original_peaks) > 1:
                 plot_start = max(0, original_peaks[0] - 200)
                 ref_peak = original_peaks[min(len(original_peaks) - 1, 6)]
                 plot_end = min(len(ecg_filtered), ref_peak + 300)
             else:
-                plot_start, plot_end = choose_plot_window(ecg_filtered, start=0, end=2000, fallback=2000)
+                plot_start, plot_end = choose_plot_window(
+                    ecg_filtered,
+                    start=0,
+                    end=2000,
+                    fallback=2000
+                )
 
             x = np.arange(plot_start, plot_end)
 
-            # Original peaks panel
-            axes[0].plot(x - plot_start, ecg_filtered[plot_start:plot_end], color='blue', lw=1.0, label='Filtered ECG')
-            orig_win = original_peaks[(original_peaks >= plot_start) & (original_peaks < plot_end)]
+            # --------------------------------------------------------------
+            # FIGURE A: Original versus final R-peaks
+            # --------------------------------------------------------------
+            fig_peaks, axes_peaks = plt.subplots(
+                2,
+                1,
+                figsize=(14, 7),
+                sharex=True,
+                constrained_layout=True
+            )
+
+            axes_peaks[0].plot(
+                x - plot_start,
+                ecg_filtered[plot_start:plot_end],
+                color='blue',
+                linewidth=1.0,
+                label='Filtered ECG'
+            )
+
+            orig_win = original_peaks[
+                (original_peaks >= plot_start)
+                & (original_peaks < plot_end)
+            ]
+
             if len(orig_win) > 0:
-                axes[0].scatter(orig_win - plot_start, ecg_filtered[orig_win], color='red', s=32, label='Original R-peaks', zorder=3)
-            axes[0].set_title(simple_title(subject, session, task, "Original R-Peaks Before signal_fixpeaks"))
-            axes[0].set_ylabel("Voltage [mV]")
-            axes[0].legend(loc='upper right')
-            axes[0].grid(True, alpha=0.3)
+                axes_peaks[0].scatter(
+                    orig_win - plot_start,
+                    ecg_filtered[orig_win],
+                    color='red',
+                    s=34,
+                    label='Originally detected R-peaks',
+                    zorder=3
+                )
 
-            # Cleaned peaks panel
-            axes[1].plot(x - plot_start, ecg_filtered[plot_start:plot_end], color='blue', lw=1.0, label='Filtered ECG')
-            clean_win = peaks_cleaned[(peaks_cleaned >= plot_start) & (peaks_cleaned < plot_end)]
-            if len(clean_win) > 0:
-                axes[1].scatter(clean_win - plot_start, ecg_filtered[clean_win], color='green', s=32, label='Cleaned R-peaks', zorder=3)
-            axes[1].set_title(simple_title(subject, session, task, "Cleaned R-Peaks After signal_fixpeaks"))
-            axes[1].set_ylabel("Voltage [mV]")
-            axes[1].legend(loc='upper right')
-            axes[1].grid(True, alpha=0.3)
+            axes_peaks[0].set_title(
+                simple_title(
+                    subject,
+                    session,
+                    task,
+                    "Original R-Peaks Before 20% Rule"
+                )
+            )
+            axes_peaks[0].set_ylabel("Voltage [mV]")
+            axes_peaks[0].legend(loc='upper right')
+            axes_peaks[0].grid(True, alpha=0.3)
 
-            # RR comparison panel
-            rr_original = np.diff(original_peaks) / sampling_rate if len(original_peaks) > 1 else np.array([])
-            rr_clean = rr_raw
+            axes_peaks[1].plot(
+                x - plot_start,
+                ecg_filtered[plot_start:plot_end],
+                color='blue',
+                linewidth=1.0,
+                label='Filtered ECG'
+            )
 
-            if len(rr_original) > 0:
-                axes[2].plot(rr_original, marker='o', markersize=4, linestyle='-', alpha=0.5, label='Original RR')
-            if len(rr_clean) > 0:
-                axes[2].plot(rr_clean, marker='o', markersize=4, linestyle='-', alpha=0.7, label='RR after signal_fixpeaks')
-                if len(invalid_indices) > 0:
-                    axes[2].scatter(
-                        invalid_indices,
-                        rr_clean[invalid_indices],
-                        color='red',
-                        marker='x',
-                        s=45,
-                        label='Flagged by 20% change rule',
-                        zorder=4
+            final_win = peaks_final[
+                (peaks_final >= plot_start)
+                & (peaks_final < plot_end)
+            ]
+
+            inserted_win = inserted_by_fixpeaks[
+                (inserted_by_fixpeaks >= plot_start)
+                & (inserted_by_fixpeaks < plot_end)
+            ]
+
+            final_original_win = np.setdiff1d(
+                final_win,
+                inserted_win,
+                assume_unique=False
+            )
+
+            if len(final_original_win) > 0:
+                axes_peaks[1].scatter(
+                    final_original_win - plot_start,
+                    ecg_filtered[final_original_win],
+                    color='green',
+                    s=34,
+                    label='Retained/corrected detected peaks',
+                    zorder=3
+                )
+
+            if len(inserted_win) > 0:
+                axes_peaks[1].scatter(
+                    inserted_win - plot_start,
+                    ecg_filtered[inserted_win],
+                    color='orange',
+                    marker='^',
+                    s=70,
+                    label='Peaks inserted by signal_fixpeaks',
+                    edgecolors='black',
+                    linewidths=0.4,
+                    zorder=5
+                )
+
+            axes_peaks[1].set_title(
+                simple_title(
+                    subject,
+                    session,
+                    task,
+                    "Final R-Peaks After 20% Removal and Interval Correction"
+                )
+            )
+            axes_peaks[1].set_xlabel("Samples Relative to Display Window")
+            axes_peaks[1].set_ylabel("Voltage [mV]")
+            axes_peaks[1].legend(loc='upper right')
+            axes_peaks[1].grid(True, alpha=0.3)
+
+            fig_peaks.suptitle(
+                simple_title(
+                    subject,
+                    session,
+                    task,
+                    "R-Peak Processing Diagnostic"
+                ),
+                fontsize=13,
+                fontweight='bold'
+            )
+
+            finalize_and_save(
+                fig_peaks,
+                os.path.join(
+                    output_folder,
+                    f"{title_base}_rpeak_processing_diagnostic.png"
+                )
+            )
+
+            # --------------------------------------------------------------
+            # FIGURE B: RR audit plot showing exactly what changed
+            # --------------------------------------------------------------
+            original_rr = (
+                np.diff(original_peaks) / sampling_rate
+                if len(original_peaks) > 1
+                else np.array([])
+            )
+            original_rr_times = (
+                original_peaks[1:] / sampling_rate
+                if len(original_peaks) > 1
+                else np.array([])
+            )
+
+            # These are the exact gap-masked RR intervals used for HR and HRV.
+            final_rr = np.asarray(rr_final_cleaned, dtype=float)
+            final_rr_times = np.asarray(rr_final_times, dtype=float)
+
+            inserted_peak_set = set(
+                np.asarray(inserted_by_fixpeaks, dtype=int).tolist()
+            )
+
+            # Recover the final RR interval endpoint peaks after gap masking.
+            all_final_start_peaks = (
+                peaks_final[:-1]
+                if len(peaks_final) > 1
+                else np.array([], dtype=int)
+            )
+            all_final_end_peaks = (
+                peaks_final[1:]
+                if len(peaks_final) > 1
+                else np.array([], dtype=int)
+            )
+
+            final_start_peaks = all_final_start_peaks[rr_gap_valid_mask]
+            final_end_peaks = all_final_end_peaks[rr_gap_valid_mask]
+
+            # A final RR interval is "split by an inserted peak" if either
+            # endpoint was inserted by signal_fixpeaks.
+            final_rr_involves_inserted_peak = np.array(
+                [
+                    (
+                        int(start_peak) in inserted_peak_set
+                        or int(end_peak) in inserted_peak_set
                     )
-            axes[2].set_title(simple_title(subject, session, task, "RR Before/After signal_fixpeaks (0.30-0.75 s) + 20% Change Rule"))
-            axes[2].set_xlabel("Beat Number")
-            axes[2].set_ylabel("RR Interval (s)")
-            axes[2].set_ylim(0, 2)
-            axes[2].legend(loc='upper right')
-            axes[2].grid(True, alpha=0.3)
+                    for start_peak, end_peak in zip(
+                        final_start_peaks,
+                        final_end_peaks
+                    )
+                ],
+                dtype=bool
+            )
 
-            fig.suptitle(simple_title(subject, session, task, "signal_fixpeaks Diagnostic"), fontsize=13, fontweight='bold')
-            finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_signal_fixpeaks.png"))
+            # Match each retained final RR back to the original raw RR sequence.
+
+            original_peak_index = {
+                int(peak): index
+                for index, peak in enumerate(original_peaks)
+            }
+
+            final_rr_matches_raw = np.zeros(len(final_rr), dtype=bool)
+            matched_raw_rr_index = np.full(len(final_rr), -1, dtype=int)
+            matched_raw_rr_sec = np.full(len(final_rr), np.nan, dtype=float)
+            rr_tolerance_sec = 1.0 / sampling_rate
+
+            for i, (start_peak, end_peak, rr_value) in enumerate(
+                zip(final_start_peaks, final_end_peaks, final_rr)
+            ):
+                start_index = original_peak_index.get(int(start_peak))
+                end_index = original_peak_index.get(int(end_peak))
+
+                if (
+                    start_index is not None
+                    and end_index is not None
+                    and end_index == start_index + 1
+                    and start_index < len(original_rr)
+                ):
+                    raw_value = original_rr[start_index]
+                    matched_raw_rr_index[i] = start_index
+                    matched_raw_rr_sec[i] = raw_value
+
+                    final_rr_matches_raw[i] = bool(
+                        np.isfinite(rr_value)
+                        and np.isfinite(raw_value)
+                        and abs(rr_value - raw_value) <= rr_tolerance_sec
+                    )
+
+            # Final RR classification used in the audit plot:
+            #   green circle  = unchanged from raw
+            #   purple triangle = interval involves an inserted R-peak
+            #   orange star   = changed from raw without an inserted endpoint
+            final_rr_unchanged = (
+                final_rr_matches_raw
+                & ~final_rr_involves_inserted_peak
+            )
+            final_rr_split_by_inserted_peak = (
+                final_rr_involves_inserted_peak
+            )
+            final_rr_modified_by_correction = (
+                ~final_rr_matches_raw
+                & ~final_rr_involves_inserted_peak
+            )
+
+            fig_audit, ax_audit = plt.subplots(
+                figsize=(16, 7),
+                constrained_layout=True
+            )
+
+            # Plot all original RR intervals first in light gray.
+            if len(original_rr) > 0:
+                ax_audit.plot(
+                    original_rr_times,
+                    original_rr,
+                    color='gray',
+                    linewidth=0.7,
+                    marker='o',
+                    markersize=4,
+                    alpha=0.45,
+                    label='Original RR',
+                    zorder=1
+                )
+
+            # Mark original RR intervals removed by the 20% rule.
+            if len(invalid_indices) > 0 and len(original_rr) > 0:
+                valid_invalid_indices = invalid_indices[
+                    invalid_indices < len(original_rr)
+                ]
+
+                ax_audit.scatter(
+                    original_rr_times[valid_invalid_indices],
+                    original_rr[valid_invalid_indices],
+                    color='red',
+                    marker='x',
+                    s=70,
+                    linewidths=1.8,
+                    label='RR removed by 20% rule',
+                    zorder=7
+                )
+
+            # Final unchanged RR intervals.
+            if np.any(final_rr_unchanged):
+                ax_audit.scatter(
+                    final_rr_times[final_rr_unchanged],
+                    final_rr[final_rr_unchanged],
+                    color='green',
+                    marker='o',
+                    s=28,
+                    label='Final RR unchanged from raw',
+                    zorder=4
+                )
+
+            # Final intervals changed by correction/removal, but without an
+            # inserted endpoint.
+            if np.any(final_rr_modified_by_correction):
+                ax_audit.scatter(
+                    final_rr_times[final_rr_modified_by_correction],
+                    final_rr[final_rr_modified_by_correction],
+                    color='orange',
+                    marker='*',
+                    s=105,
+                    edgecolors='black',
+                    linewidths=0.35,
+                    label='Final RR modified by correction',
+                    zorder=5
+                )
+
+            # Final intervals created/split around an inserted peak.
+            if np.any(final_rr_split_by_inserted_peak):
+                ax_audit.scatter(
+                    final_rr_times[final_rr_split_by_inserted_peak],
+                    final_rr[final_rr_split_by_inserted_peak],
+                    color='purple',
+                    marker='^',
+                    s=78,
+                    edgecolors='black',
+                    linewidths=0.35,
+                    label='Final RR split by inserted R-peak',
+                    zorder=6
+                )
+
+            # Shade bad segments so removed time periods remain visible.
+            bad_label_used = False
+            for seg in bad_segments:
+                ax_audit.axvspan(
+                    seg["start_sec"],
+                    seg["end_sec"],
+                    color='red',
+                    alpha=0.08,
+                    label=(
+                        'Removed bad segment'
+                        if not bad_label_used
+                        else None
+                    ),
+                    zorder=0
+                )
+                bad_label_used = True
+
+            ax_audit.set_title(
+                simple_title(
+                    subject,
+                    session,
+                    task,
+                    "RR Audit: Original, Removed, Unchanged, Modified, and Inserted"
+                )
+            )
+            ax_audit.set_xlabel("Task Time After bas+ (seconds)")
+            ax_audit.set_ylabel("RR Interval (seconds)")
+            ax_audit.set_ylim(0, 2)
+            ax_audit.grid(True, alpha=0.3)
+            ax_audit.legend(loc='upper right')
+
+            finalize_and_save(
+                fig_audit,
+                os.path.join(
+                    output_folder,
+                    f"{title_base}_rr_processing_audit.png"
+                )
+            )
+
+            if len(final_rr) > 0:
+                pd.DataFrame({
+                    "final_rr_index": np.arange(len(final_rr)),
+                    "final_rr_time_sec": final_rr_times,
+                    "final_rr_interval_sec": final_rr,
+                    "start_peak_sample": final_start_peaks,
+                    "end_peak_sample": final_end_peaks,
+                    "start_peak_was_inserted": [
+                        int(value) in inserted_peak_set
+                        for value in final_start_peaks
+                    ],
+                    "end_peak_was_inserted": [
+                        int(value) in inserted_peak_set
+                        for value in final_end_peaks
+                    ],
+                    "rr_involves_inserted_peak": (
+                        final_rr_involves_inserted_peak
+                    ),
+                    "matched_raw_rr_index": matched_raw_rr_index,
+                    "matched_raw_rr_interval_sec": matched_raw_rr_sec,
+                    "final_rr_matches_raw": final_rr_matches_raw,
+                    "audit_class": np.select(
+                        [
+                            final_rr_split_by_inserted_peak,
+                            final_rr_modified_by_correction,
+                            final_rr_unchanged
+                        ],
+                        [
+                            "split_by_inserted_rpeak",
+                            "modified_by_correction",
+                            "unchanged_from_raw"
+                        ],
+                        default="unclassified"
+                    )
+                }).to_csv(
+                    os.path.join(
+                        output_folder,
+                        f"{title_base}_final_rr_audit.csv"
+                    ),
+                    index=False
+                )
+
 
         except Exception as e:
             save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_signal_fixpeaks.png"),
-                simple_title(subject, session, task, "Signal FixPeaks"),
-                f"signal_fixpeaks ran, but the custom diagnostic plot failed: {e}"
+                os.path.join(
+                    output_folder,
+                    f"{title_base}_rpeak_processing_diagnostic.png"
+                ),
+                simple_title(
+                    subject,
+                    session,
+                    task,
+                    "R-Peak Processing Diagnostic"
+                ),
+                f"Could not create R-peak processing diagnostic: {e}"
             )
 
-        # 10. Original vs cleaned peak comparison 
-        plot_peak_correction_comparison(
-            ecg_filtered, original_peaks, peaks_cleaned, sampling_rate,
-            title_base, output_folder, task_label
-        )
+            save_placeholder_plot(
+                os.path.join(
+                    output_folder,
+                    f"{title_base}_rr_processing_audit.png"
+                ),
+                simple_title(
+                    subject,
+                    session,
+                    task,
+                    "Raw RR vs Final RR"
+                ),
+                f"Could not create RR processing diagnostic: {e}"
+            )
+
 
         # 11. Cleaned RR intervals
        
@@ -1529,7 +2268,7 @@ for index, file_path in enumerate(file_paths, start=1):
                 rr_20pct_plot,
                 marker='o',
                 linestyle='-',
-                label='RR after signal_fixpeaks, 20% rule applied',
+                label='Original RR after 20% rule',
                 markersize=4,
                 alpha=0.6
             )
@@ -1552,7 +2291,7 @@ for index, file_path in enumerate(file_paths, start=1):
                 marker='o',
                 linestyle='None',
                 color='green',
-                label='Final RR used for HR/HRV',
+                label='Final RR after interval correction, used for HR/HRV',
                 markersize=4
             )
 
@@ -1909,7 +2648,7 @@ for index, file_path in enumerate(file_paths, start=1):
                 raise ValueError("Not enough final clean RR intervals for 4 Hz PSD after bad-segment removal.")
 
             # Use final clean RR intervals.
-            # Convert seconds to milliseconds because HRV PSD is traditionally in ms².
+            # Convert seconds to milliseconds because HRV PSD is traditionally in ms²/Hz.
             rri_ms = rr_final_cleaned.astype(float) * 1000
             rri_time = np.cumsum(rr_final_cleaned)
             interp_rate = 4
@@ -2316,6 +3055,26 @@ for index, file_path in enumerate(file_paths, start=1):
             ('subject_id', subject.replace('sub-', '')),
             ('session_id', session.replace('ses-', '')),
             ('task_name', task),
+            ('selected_ecg_channel', ecg_channel),
+            ('ecg_channel_selection_decision', ecg_channel_source),
+            (
+                'available_ecg_candidate_channels',
+                ';'.join(
+                    ecg_selection_details.get(
+                        'available_channels',
+                        []
+                    )
+                )
+            ),
+            (
+                'candidate_channel_rpeak_counts',
+                str(
+                    ecg_selection_details.get(
+                        'rpeak_counts',
+                        {}
+                    )
+                )
+            ),
             ('sampling_rate_hz', sampling_rate),
             ('full_recording_duration_seconds', round(full_duration_sec, 6)),
             ('analysis_start_sec', round(float(task_start_sec), 6)),
@@ -2332,11 +3091,14 @@ for index, file_path in enumerate(file_paths, start=1):
             ('usable_epoch_pct', round(float(usable_epoch_pct), 6)),
             ##################################
             ('num_peaks_detected', int(len(original_peaks))),
+            ('processing_order', '20percent_rule_then_fixpeaks_interval_limits'),
+            ('rr_change_threshold_percent', round(RR_PERCENT_CHANGE_THRESHOLD * 100, 2)),
+            ('num_peaks_after_20percent_bad_segment_removal', int(len(peaks_after_20pct_removal))),
             ('fixpeaks_interval_min_sec', FIXPEAKS_INTERVAL_MIN),
             ('fixpeaks_interval_max_sec', FIXPEAKS_INTERVAL_MAX),
-            ('num_peaks_cleaned_after_fixpeaks', int(len(peaks_cleaned))),
-            ('num_peaks_final_after_bad_segment_removal', int(len(peaks_final))),
-            ('rr_change_threshold_percent', round(RR_PERCENT_CHANGE_THRESHOLD * 100, 2)),
+            ('num_peaks_inserted_by_fixpeaks', int(len(inserted_by_fixpeaks))),
+            ('num_peaks_removed_by_fixpeaks', int(len(removed_by_fixpeaks))),
+            ('num_peaks_final_after_fixpeaks', int(len(peaks_final))),
             ('rr_change_formula', 'abs(RR_n - RR_n_minus_1) / RR_n'),
             ('num_bad_segments_20percent', int(len(bad_segments))),
             ('rr_20percent_intervals_removed', int(beats_removed)),
@@ -2357,13 +3119,13 @@ for index, file_path in enumerate(file_paths, start=1):
         ]
         save_rs_summary_csv(output_folder, title_base, summary_rows)
 
-        print(f"\n Finished: {filename}")
+        print(f"\n✅ Finished: {filename}")
         print(f"Outputs saved in: {output_folder}")
 
     except Exception as e:
         current_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         full_traceback = traceback.format_exc()
-        print(f"\n CRITICAL ERROR SKIPPED FOR {filename}")
+        print(f"\n❌ CRITICAL ERROR SKIPPED FOR {filename}")
         print(f"Error Type: {type(e).__name__}")
         print(f"Error Message: {str(e)}")
         print(f"{'-'*40}")
