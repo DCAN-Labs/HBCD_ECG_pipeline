@@ -23,23 +23,59 @@ import re
 
 
 def parse_command_line_args():
+    """
+    Parse command-line arguments in BIDS-Apps format.
+    
+    Supports both BIDS-Apps positional style:
+        script input_dir output_dir analysis_level --participant-label 100247 --session-label V03 --tasks RS
+    
+    And legacy named argument style:
+        script --input-dir /bids --output-dir /outputs --tasks RS
+    """
 
     parser = argparse.ArgumentParser(
-        description="Run the HBCD ECG task-based QC pipeline."
+        description="Run the HBCD ECG task-based QC pipeline (BIDS-Apps compatible)."
+    )
+
+    # BIDS-Apps positional arguments
+    parser.add_argument(
+        "bids_dir",
+        nargs="?",
+        default=None,
+        help="Input BIDS directory containing subject data"
     )
 
     parser.add_argument(
-        "--input-dir",
-        default=r"Z:\Projects\BillFifer\HBCD\ECG Pipeline\HBCD",
-        help="Folder containing HBCD BIDS-style data. Example: /Users/Lynn/Desktop/ECG Pipeline/HBCD"
+        "output_dir",
+        nargs="?",
+        default=None,
+        help="Output directory where results will be saved"
     )
 
     parser.add_argument(
-        "--output-dir",
-        default=r"Z:\Projects\BillFifer\HBCD\ECG Pipeline\HBCD_ECG_Pipeline_Output_v5",
-        help="Folder where output plots and summary CSV files will be saved."
+        "analysis_level",
+        nargs="?",
+        default="participant_level",
+        choices=["participant_level", "group_level"],
+        help="Level of analysis (participant or group). Currently only participant is supported."
     )
 
+    # BIDS-Apps named participant/session filters
+    parser.add_argument(
+        "--participant-label",
+        nargs="+",
+        default=None,
+        help="Space-separated participant labels to process (e.g., --participant-label 100247 100248)"
+    )
+
+    parser.add_argument(
+        "--session-label",
+        nargs="+",
+        default=None,
+        help="Space-separated session labels to process (e.g., --session-label V03 V04)"
+    )
+
+    # Task specification
     parser.add_argument(
         "--tasks",
         nargs="+",
@@ -47,6 +83,22 @@ def parse_command_line_args():
         help="Task(s) to process. Example: --tasks RS or --tasks RS MMN FACE VEP"
     )
 
+    # Legacy/optional directory arguments
+    parser.add_argument(
+        "--input-dir",
+        dest="input_dir_named",
+        default=None,
+        help="(Legacy) Input directory via named argument"
+    )
+
+    parser.add_argument(
+        "--output-dir",
+        dest="output_dir_named",
+        default=None,
+        help="(Legacy) Output directory via named argument"
+    )
+
+    # ECG-specific parameters
     parser.add_argument(
         "--acq",
         default="ecg",
@@ -82,8 +134,25 @@ def parse_command_line_args():
     if unknown:
         print("Note: ignoring extra command-line arguments:", unknown)
 
-    return args
+    # Resolve input directory (priority: legacy named > BIDS-Apps positional > default)
+    final_input_dir = (
+        args.input_dir_named or 
+        args.bids_dir or 
+        r"Z:\Projects\BillFifer\HBCD\ECG Pipeline\HBCD"
+    )
 
+    # Resolve output directory (priority: legacy named > BIDS-Apps positional > default)
+    final_output_dir = (
+        args.output_dir_named or 
+        args.output_dir or 
+        r"Z:\Projects\BillFifer\HBCD\ECG Pipeline\HBCD_ECG_Pipeline_Output_v5"
+    )
+
+    # Store resolved directories back to args
+    args.input_dir = final_input_dir
+    args.output_dir = final_output_dir
+
+    return args
 
 ARGS = parse_command_line_args()
 
@@ -186,14 +255,45 @@ def simple_title(subject, session, task, suffix):
 
 
 
-def find_task_set_files(input_dir, tasks_to_process, acq_to_process="ecg"):
+def find_task_set_files(
+    input_dir,
+    tasks_to_process,
+    acq_to_process="ecg",
+    participant_labels=None,
+    session_labels=None,
+):
     all_set_files = []
-    for task in tasks_to_process:
-        pattern = f"sub-*/ses-*/eeg/*task-{task}_acq-{acq_to_process}*eeg.set"
-        task_files = list(input_dir.glob(pattern))
-        print(f"Search pattern for task-{task}: {input_dir / pattern}")
-        print(f"Found {len(task_files)} task-{task} acq-{acq_to_process} .set files.\n")
-        all_set_files.extend(task_files)
+
+    # If no filters are provided, search everything
+    participants = (
+        [f"sub-{p}" if not str(p).startswith("sub-") else str(p)
+         for p in participant_labels]
+        if participant_labels
+        else ["sub-*"]
+    )
+
+    sessions = (
+        [f"ses-{s}" if not str(s).startswith("ses-") else str(s)
+         for s in session_labels]
+        if session_labels
+        else ["ses-*"]
+    )
+
+    for participant in participants:
+        for session in sessions:
+            for task in tasks_to_process:
+                pattern = (
+                    f"{participant}/{session}/eeg/"
+                    f"*task-{task}_acq-{acq_to_process}*eeg.set"
+                )
+
+                task_files = list(input_dir.glob(pattern))
+
+                print(f"Search pattern: {input_dir / pattern}")
+                print(f"Found {len(task_files)} files.\n")
+
+                all_set_files.extend(task_files)
+
     return sorted(all_set_files)
 
 
@@ -1345,7 +1445,13 @@ def nan_summary(arr):
 # ------------------------------------------------------------
 # FIND FILES
 # ------------------------------------------------------------
-file_paths = find_task_set_files(INPUT_DIR, TASKS_TO_PROCESS, ACQ_TO_PROCESS)
+file_paths = find_task_set_files(
+    INPUT_DIR,
+    TASKS_TO_PROCESS,
+    ACQ_TO_PROCESS,
+    participant_labels=ARGS.participant_label,
+    session_labels=ARGS.session_label,
+)
 if not file_paths:
     print(f"Status: No .set files found in {INPUT_DIR}")
     raise SystemExit(1)
