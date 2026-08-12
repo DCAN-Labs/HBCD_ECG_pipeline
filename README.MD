@@ -2,7 +2,7 @@
 
 A BIDS-style ECG quality-control and analysis workflow for task-based EEG/ECG recordings.
 
-This repository contains a processing script, HBCD_ECG_pipeline_v4.py, that reads EEGLab .set files, extracts an ECG channel, crops the signal to the task window, performs signal cleaning and R-peak analysis, and generates plots and CSV summaries for QC review.
+This repository contains a processing script, HBCD_ECG_pipeline_v6.py, that reads EEGLab .set files, extracts an ECG channel, crops the signal to the task window, performs signal cleaning and R-peak analysis, and generates plots and CSV summaries for QC review.
 
 ## What the pipeline does
 
