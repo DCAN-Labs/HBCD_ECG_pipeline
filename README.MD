@@ -55,13 +55,13 @@ Install them in your Python environment before running the script.
 Run the pipeline from the repository directory:
 
 ```bash
-python HBCD_ECG_pipeline_v4.py <bids_dir> <output_dir> <analysis_level> [options]
+python HBCD_ECG_pipeline_v6.py <bids_dir> <output_dir> <analysis_level> [options]
 ```
 
 ### Example
 
 ```bash
-python HBCD_ECG_pipeline_v4.py /path/to/bids /path/to/output participant_level \
+python HBCD_ECG_pipeline_v6.py /path/to/bids /path/to/output participant_level \
   --participant_label 1234 \
   --session_label V01 \
   --tasks RS \
