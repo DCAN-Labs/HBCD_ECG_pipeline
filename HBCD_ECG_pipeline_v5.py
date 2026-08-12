@@ -6,18 +6,18 @@
 #   2. If no channel is selected, log the file and skip all ECG processing.
 #   3. Run the full ECG QC, RR, HR, and HRV pipeline on the selected channel.
 
-
+import argparse
+import datetime
 import os
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import neurokit2 as nk
 import mne
 from scipy.signal import welch
-from pathlib import Path
-import traceback
-import datetime
-import argparse
 import re
 
 
@@ -137,15 +137,13 @@ def parse_command_line_args():
     # Resolve input directory (priority: legacy named > BIDS-Apps positional > default)
     final_input_dir = (
         args.input_dir_named or 
-        args.bids_dir or 
-        r"Z:\Projects\BillFifer\HBCD\ECG Pipeline\HBCD"
+        args.bids_dir
     )
 
     # Resolve output directory (priority: legacy named > BIDS-Apps positional > default)
     final_output_dir = (
         args.output_dir_named or 
-        args.output_dir or 
-        r"Z:\Projects\BillFifer\HBCD\ECG Pipeline\HBCD_ECG_Pipeline_Output_v5"
+        args.output_dir
     )
 
     # Store resolved directories back to args
