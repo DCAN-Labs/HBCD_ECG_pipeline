@@ -548,8 +548,8 @@ def append_no_ecg_skip_log(
     details
 ):
     """
-    Append a text-only record when a file is skipped because no ECG channel
-    was selected. 
+        Write the no-ECG log at the participant level.
+    
     """
     log_path = Path(output_dir) / subject / session / "skipped_no_ecg_channel_log.txt"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -598,10 +598,45 @@ def make_output_folder(output_dir, set_file, task):
     subject = next(part for part in parts if part.startswith("sub-"))
     session = next(part for part in parts if part.startswith("ses-"))
     task_folder = f"{task.lower()}-task"
-    output_folder = output_dir / subject / session / "ecg" / task_folder
-    output_folder.mkdir(parents=True, exist_ok=True)
-    return output_folder, subject, session
 
+    output_folder = output_dir / subject / session / "ecg" / task_folder
+
+    # They are created only after an ECG channel is successfully selected.
+    png_folder = output_folder / "png"
+    csv_folder = output_folder / "csv"
+    set_folder = output_folder / "data"
+
+    # Always create only the participant/session/task-level folder.
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    return (
+            output_folder,
+            png_folder,
+            csv_folder,
+            set_folder,
+            subject,
+            session
+        )
+
+
+def create_ecg_output_subfolders(png_folder, csv_folder, set_folder):
+    """
+    Create processing-output subfolders only after an ECG channel has been
+    successfully selected.
+
+    This keeps skipped no-ECG participants clean:
+      rs-task/
+        skipped_no_ecg_channel_log.txt
+
+    while successfully processed participants contain:
+      rs-task/
+        png/
+        csv/
+        set/
+    """
+    Path(png_folder).mkdir(parents=True, exist_ok=True)
+    Path(csv_folder).mkdir(parents=True, exist_ok=True)
+    Path(set_folder).mkdir(parents=True, exist_ok=True)
 
 def save_placeholder_plot(output_path, title, message):
     fig, ax = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
@@ -631,9 +666,9 @@ def choose_plot_window(signal, start=4000, end=6000, fallback=2000):
     return start, min(len(signal), end)
 
 
-def safe_minmax(arr):
-    arr = np.asarray(arr)
-    return float(np.nanmin(arr)), float(np.nanmax(arr))
+# def safe_minmax(arr):
+#     arr = np.asarray(arr)
+#     return float(np.nanmin(arr)), float(np.nanmax(arr))
 
 
 def read_events_file(events_tsv):
@@ -733,7 +768,6 @@ def get_qc_spike_events(events_df):
 
 def plot_first_n_seconds_after_task_start(signal, sampling_rate, n_seconds, subject, session, task, output_path, signal_name='Raw ECG'):
     """
-    Plot the first n_seconds of the cropped task signal.
 
     This plot shows the first n_seconds after bas+.
     """
@@ -1108,9 +1142,12 @@ def apply_fixpeaks_within_good_segments(
 
     This prevents interval_max from inserting evenly spaced peaks across a
     bad segment already removed by the 20% RR-change rule.
+
+    Inserted/removed peaks are identified by directly comparing the input
+    and corrected peak arrays.
     """
     peaks = np.asarray(peaks, dtype=int)
-
+    
     if len(peaks) == 0:
         return np.array([], dtype=int), {
             "inserted_peaks": np.array([], dtype=int),
@@ -1134,8 +1171,6 @@ def apply_fixpeaks_within_good_segments(
         good_ranges.append((current_start, signal_length))
 
     corrected_all = []
-    inserted_all = []
-    removed_all = []
 
     for good_start, good_end in good_ranges:
         segment_peaks = peaks[
@@ -1149,7 +1184,7 @@ def apply_fixpeaks_within_good_segments(
         relative_peaks = segment_peaks - good_start
 
         try:
-            info_segment, corrected_relative = nk.signal_fixpeaks(
+            _, corrected_relative = nk.signal_fixpeaks(
                 relative_peaks,
                 sampling_rate=sampling_rate,
                 method="neurokit",
@@ -1168,14 +1203,6 @@ def apply_fixpeaks_within_good_segments(
 
             corrected_all.extend(corrected_absolute.tolist())
 
-            inserted = np.asarray(info_segment.get("missed", []), dtype=int)
-            removed = np.asarray(info_segment.get("extra", []), dtype=int)
-
-            if len(inserted):
-                inserted_all.extend((inserted + good_start).tolist())
-            if len(removed):
-                removed_all.extend((removed + good_start).tolist())
-
         except Exception as exc:
             print(
                 f"WARNING: signal_fixpeaks failed in good segment "
@@ -1187,16 +1214,27 @@ def apply_fixpeaks_within_good_segments(
 
     corrected_all = np.asarray(sorted(set(corrected_all)), dtype=int)
 
-    # Final protection against peaks being placed back inside removed gaps.
     corrected_all = remove_peaks_in_bad_segments(
         corrected_all,
         bad_segments,
         sampling_rate
     )
 
+    inserted_peaks = np.setdiff1d(
+        corrected_all,
+        peaks,
+        assume_unique=False
+    ).astype(int)
+
+    removed_peaks = np.setdiff1d(
+        peaks,
+        corrected_all,
+        assume_unique=False
+    ).astype(int)
+
     return corrected_all, {
-        "inserted_peaks": np.asarray(sorted(set(inserted_all)), dtype=int),
-        "removed_peaks": np.asarray(sorted(set(removed_all)), dtype=int)
+        "inserted_peaks": inserted_peaks,
+        "removed_peaks": removed_peaks
     }
 
 
@@ -1347,7 +1385,6 @@ def compute_safe_interpolated_hr_from_rr(
             end_time = rr_times[i + 1]
             gap = end_time - start_time
 
-            # This is the key safety step:
             # Do not draw a continuous HR line across a removed/bad segment.
             if max_gap_sec is not None and gap > max_gap_sec:
                 continue
@@ -1406,7 +1443,7 @@ def process_file(
     print(f"{'='*70}")
 
     try:
-        output_folder, subject, session = make_output_folder(config.output_dir, file_path, task)
+        output_folder, png_folder, csv_folder, set_folder, subject, session = make_output_folder(config.output_dir, file_path, task)
         print(f"Saving outputs to: {output_folder}")
 
         channels_tsv, events_tsv = get_matching_sidecars(file_path)
@@ -1449,6 +1486,14 @@ def process_file(
             plt.close("all")
             return True
 
+        # ECG was successfully selected, so now create the processing
+        # subfolders for this participant/task.
+        create_ecg_output_subfolders(
+            png_folder,
+            csv_folder,
+            set_folder
+        )
+
         print(f"Using automatically selected ECG channel: {ecg_channel}")
         print(f"ECG channel selection decision: {ecg_channel_source}")
         print(
@@ -1487,7 +1532,7 @@ def process_file(
 
 
         ######################################################################
-
+        
 
         if marker_start_sec is not None:
             print(f"Start marker: {marker_start_label} @ {marker_start_sec:.3f}s")
@@ -1560,6 +1605,18 @@ def process_file(
         print(f"Task samples after cropping: {len(ecg_raw)}")
         print(f"Task duration after cropping: {len(ecg_raw)/sampling_rate:.1f} seconds")
 
+        # Generate .set file for trimmed raw task only
+        # 1. Convert 1D ecg_raw array into a 2D array (shape: 1 x n_samples)
+        ecg_data_2d = ecg_raw[np.newaxis, :]
+
+        # 2. Define channel information and create the MNE Raw object
+        info = mne.create_info(ch_names=['ECG'], sfreq=sampling_rate, ch_types=['ecg'])
+        raw_trimmed = mne.io.RawArray(ecg_data_2d, info, verbose=False)
+
+        # 3. Export to .set file in your output directory
+        set_path = os.path.join(set_folder, f"{title_base}_raw_bas_trsp.set")
+        raw_trimmed.export(set_path, fmt="eeglab", overwrite=True, verbose=False)
+
 
         # This plot shows ALL raw ECG data after cropping to bas+ -> TRSP.
         raw_times = np.arange(len(ecg_raw)) / sampling_rate
@@ -1570,41 +1627,11 @@ def process_file(
         ax.set_xlabel("Task Time After bas+ (seconds)")
         ax.set_ylabel("Amplitude [mV]")
         ax.grid(True, alpha=0.3)
-        finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_raw_ecg.png"))
+        finalize_and_save(fig, os.path.join(png_folder, f"{title_base}_raw_ecg.png"))
 
-        # 1a. Raw ECG - first 25 seconds after bas+
-        plot_first_n_seconds_after_task_start(
-            ecg_raw,
-            sampling_rate,
-            25,
-            subject,
-            session,
-            task,
-            os.path.join(output_folder, f"{title_base}_raw_ecg_first25sec_after_bas.png"),
-            signal_name="Raw ECG"
-        )
-
-        # 2. Raw PSD
-        try:
-            nk.signal_psd(ecg_raw, method="welch", min_frequency=1, show=True)
-            fig = plt.gcf()
-            fig.set_size_inches(*WIDE_TALL_FIG)
-            ax = fig.axes[0]
-            ax.set_title(simple_title(subject, session, task, "Power Spectral Density - Unfiltered ECG"))
-            ax.set_xlim(0, 100)
-            ax.axvline(60, color='red', linestyle='--', label='60 Hz Powerline')
-            ax.legend(loc='upper right')
-            finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_raw_psd.png"))
-        except Exception as e:
-            save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_raw_psd.png"),
-                simple_title(subject, session, task, "Power Spectral Density - Unfiltered ECG"),
-                f"Could not compute raw PSD: {e}"
-            )
 
         # 3. Filter
         # Filtering removes slow drift, high-frequency noise, and 60 Hz electrical noise.
-        # This is already bas+ to TRSP only.
         ecg_filtered = nk.signal_filter(
             ecg_raw,
             sampling_rate=sampling_rate,
@@ -1614,153 +1641,25 @@ def process_file(
             order=2,
             powerline=60
         )
+        # Generate .set file for trimmed Bas+ to TRSP signal
+        
+        # 1. Convert 1D ecg_filtered array into a 2D array (shape: 1 x n_samples)
+        ecg_filtered_2d = ecg_filtered[np.newaxis, :]
 
-        # 4. Filtered ECG
-        fig, ax = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
-        start, end = choose_plot_window(ecg_filtered)
-        ax.plot(np.arange(start, end), ecg_filtered[start:end], color='red', lw=0.9,
-                label='Filtered (60 Hz Notch + 1-40 Hz Bandpass)')
-        ax.set_title(simple_title(subject, session, task, "Filtered ECG"))
-        ax.set_xlabel("Samples [N]")
-        ax.set_ylabel("Voltage [mV]")
-        ax.legend(loc='upper right')
-        finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_filtered_ecg.png"))
+        # 2. Define channel information and create the MNE Raw object
+        info = mne.create_info(ch_names=['ECG'], sfreq=sampling_rate, ch_types=['ecg'])
+        raw_filtered = mne.io.RawArray(ecg_filtered_2d, info, verbose=False)
+
+        set_path = os.path.join(set_folder, f"{title_base}_filtered_ecg.set")
+        raw_filtered.export(set_path, fmt="eeglab", overwrite=True, verbose=False)
 
 
-
-        # 5. Quality plot with threshold line
-        # Higher values mean the signal looks more like clean ECG.
-        quality = np.asarray(nk.ecg_quality(ecg_filtered, sampling_rate=sampling_rate, method="templatematch")).flatten()
-        fig, ax = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
-        if len(quality) > 1:
-            ax.plot(quality, lw=1.0)
-        else:
-            ax.scatter([0], quality, color='red')
-        ax.axhline(config.quality_threshold, color='red', linestyle='--', linewidth=1.5,
-                   label=f'Threshold = {config.quality_threshold}')
-        ax.set_title(simple_title(subject, session, task, "ECG Quality (Template Match)"))
-        ax.set_xlabel("Samples [N]")
-        ax.set_ylabel("Correlation Coefficient [r]")
-        qmin, qmax = safe_minmax(quality)
-        ax.set_ylim(qmin - 0.05 * (1.0 - qmin), 1.0)
-        ax.legend(loc='lower right')
-        finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_quality.png"))
-
-        # Quality summary
-        min_val = np.min(quality)
-        n_worst = min(5, len(quality))
-        worst_indices = np.argpartition(quality, n_worst - 1)[:n_worst] if n_worst > 0 else []
-        worst_values = quality[worst_indices] if n_worst > 0 else []
-        high_quality_pct = (np.sum(quality >= config.quality_threshold) / len(quality)) * 100
-
-        print("--- Quality Report: ---")
-        print(f"Absolute Minimum Quality: {min_val:.4f}")
-        print(f"Absolute Maximum Quality: {np.max(quality):.4f}")
-        print(f"Mean Quality: {np.mean(quality):.4f}")
-        print(f"Standard Deviation: {np.std(quality):.4f}")
-        print(f"Percentage of file > {config.quality_threshold} quality: {high_quality_pct:.2f}%")
-
-        # 6. High-quality segments plot
-        try:
-            events = nk.events_find(quality, threshold=config.quality_threshold, threshold_keep='above', duration_min=sampling_rate * 30)
-            onsets = np.asarray(events['onset'])
-            offsets = np.asarray(events['onset']) + np.asarray(events['duration'])
-            nk.events_plot([onsets, offsets], quality)
-            fig = plt.gcf()
-            fig.set_size_inches(*WIDE_FIG)
-            ax = fig.axes[0]
-
-            handles, labels = ax.get_legend_handles_labels()
-            new_labels = []
-            for lab in labels:
-                if lab == "0":
-                    new_labels.append("Onset")
-                elif lab == "1":
-                    new_labels.append("Offset")
-                else:
-                    new_labels.append(lab)
-            if handles:
-                ax.legend(handles, new_labels, loc="lower right")
-
-            ax.set_title(simple_title(subject, session, task, f"Detected High-Quality Segments (r > {config.quality_threshold})"))
-            ax.set_xlabel("Samples [N]")
-            ax.set_ylabel("Correlation Coefficient [r]")
-            finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_high_quality_segments.png"))
-        except Exception as e:
-            events = {'onset': np.array([]), 'duration': np.array([])}
-            onsets = np.array([])
-            offsets = np.array([])
-            save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_high_quality_segments.png"),
-                simple_title(subject, session, task, f"Detected High-Quality Segments (r > {config.quality_threshold})"),
-                f"Could not identify/plot high-quality segments: {e}"
-            )
-
-        # Segment report
-        total_usable_seconds = sum(events['duration']) / sampling_rate if len(events['duration']) > 0 else 0
 
         # 7. Peaks
         rpeaks, info = nk.ecg_peaks(ecg_filtered, sampling_rate=sampling_rate)
         original_peaks = np.asarray(info['ECG_R_Peaks'], dtype=int)
         rr_intervals_sec = np.diff(original_peaks) / sampling_rate if len(original_peaks) > 1 else np.array([])
 
-        # R-peak validation plot
-        try:
-            if len(original_peaks) > 1:
-                plot_start, plot_end = choose_plot_window(ecg_filtered, start=4000, end=5000, fallback=1000)
-                x = np.arange(plot_start, plot_end)
-
-                peaks_in_window = original_peaks[
-                    (original_peaks >= plot_start) & (original_peaks < plot_end)
-                ]
-
-                fig, ax = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
-                ax.plot(
-                    x - plot_start,
-                    ecg_filtered[plot_start:plot_end],
-                    color='blue',
-                    lw=1.0,
-                    label='Filtered ECG'
-                )
-
-                if len(peaks_in_window) > 0:
-                    ax.scatter(
-                        peaks_in_window - plot_start,
-                        ecg_filtered[peaks_in_window],
-                        color='red',
-                        s=32,
-                        label='R-peaks',
-                        zorder=3
-                    )
-
-                ax.set_title(simple_title(subject, session, task, "R-Peak Detection Validation"))
-                ax.set_xlabel("Samples [N]")
-                ax.set_ylabel("Voltage [mV]")
-                ax.legend(loc='lower right')
-                ax.grid(True, alpha=0.3)
-                finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_rpeak_validation.png"))
-            else:
-                save_placeholder_plot(
-                    os.path.join(output_folder, f"{title_base}_rpeak_validation.png"),
-                    simple_title(subject, session, task, "R-Peak Detection Validation"),
-                    "Not enough R-peaks detected to plot validation."
-                )
-        except Exception as e:
-            save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_rpeak_validation.png"),
-                simple_title(subject, session, task, "R-Peak Detection Validation"),
-                f"Could not plot R-peaks: {e}"
-            )
-
-        # 8. RR intervals from original peaks
-        fig, ax = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
-        if len(rr_intervals_sec) > 0:
-            ax.plot(rr_intervals_sec, marker='o', linestyle='-', lw=1.0, markersize=4)
-        ax.set_title(simple_title(subject, session, task, "RR Intervals from Original R-Peaks"))
-        ax.set_xlabel("Beat Number")
-        ax.set_ylabel("RR Interval (seconds)")
-        ax.set_ylim(0, 2)
-        finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_rr_intervals.png"))
 
         # 9. FIRST: apply the 20% RR-change rule to ORIGINAL detected peaks.
         (
@@ -1849,6 +1748,119 @@ def process_file(
             rr_final_cleaned,
             sampling_rate
         )
+        # ------------------------------------------------------------
+        # EXPORT ANALYSIS-READY ECG DERIVATIVES
+        # ------------------------------------------------------------
+        #
+        # Save both waveform products and final beat-derived products.
+        #
+        # *_filtered_ecg.set
+        #     = reusable trimmed + filtered ECG waveform.
+        #
+        # *_final_processed_ecg.set
+        #     = filtered ECG with 20%-defined excluded segments masked.
+        #
+        #
+        # *_final_rpeaks_rr.csv
+        #     = exact RR intervals used for HR/HRV.
+        #
+
+        inserted_peak_set = set(
+            np.asarray(inserted_by_fixpeaks, dtype=int).tolist()
+        )
+
+        # A. Final processed ECG waveform
+        #
+        # This keeps the reusable filtered ECG waveform on the original
+        # task-relative timeline while masking 20%-defined excluded segments.
+        # signal_fixpeaks corrections are represented in final_rpeaks.csv and
+        # final_rr.csv.
+
+        #1. Start with the filtered ECG waveform
+        ecg_final_processed = ecg_filtered.astype(float).copy()
+
+        #2. Mask bad segments with NaN values
+        for seg in bad_segments:
+            start_sample = int(max(0, seg["start_sample"]))
+            end_sample = int(
+                min(
+                    len(ecg_final_processed) - 1,
+                    seg["end_sample"]
+                )
+            )
+
+            if end_sample >= start_sample:
+                ecg_final_processed[
+                    start_sample:end_sample + 1
+                ] = np.nan
+
+        #3. Convert the 1D array into a 2D array for MNE compatibility
+        final_ecg_2d = ecg_final_processed[np.newaxis, :]
+
+        final_ecg_info = mne.create_info(
+            ch_names=["ECG"],
+            sfreq=sampling_rate,
+            ch_types=["ecg"]
+        )
+
+        raw_final_processed = mne.io.RawArray(
+            final_ecg_2d,
+            final_ecg_info,
+            verbose=False
+        )
+
+        final_set_path = os.path.join(
+            set_folder,
+            f"{title_base}_final_processed_ecg.set"
+        )
+
+        raw_final_processed.export(
+            final_set_path,
+            fmt="eeglab",
+            overwrite=True,
+            verbose=False
+        )
+
+
+        # B. Exact final RR intervals used for HR/HRV and Rpeaks
+        all_final_start_peaks = (
+            peaks_final[:-1]
+            if len(peaks_final) > 1
+            else np.array([], dtype=int)
+        )
+        all_final_end_peaks = (
+            peaks_final[1:]
+            if len(peaks_final) > 1
+            else np.array([], dtype=int)
+        )
+
+        final_rr_start_peaks = all_final_start_peaks[rr_gap_valid_mask]
+        final_rr_end_peaks = all_final_end_peaks[rr_gap_valid_mask]
+
+        final_rr_df = pd.DataFrame({
+            "rr_index": np.arange(len(rr_final_cleaned), dtype=int),
+            "rr_time_sec": rr_final_times,
+            "rr_interval_sec": rr_final_cleaned,
+            "heart_rate_bpm": (
+                60.0 / rr_final_cleaned
+                if len(rr_final_cleaned) > 0
+                else np.array([])
+            )
+        })
+
+        final_rr_path = os.path.join(
+            csv_folder,
+            f"{title_base}_final_rpeaks_rr.csv"
+        )
+        final_rr_df.to_csv(final_rr_path, index=False)
+
+        print("Analysis-ready processed data exported:")
+        print(
+            "  Reusable filtered ECG waveform: "
+            + os.path.join(set_folder, f"{title_base}_filtered_ecg.set")
+        )
+        print(f"  Final processed ECG waveform: {final_set_path}")
+        print(f"  Final RR used for HR/HRV: {final_rr_path}")
 
 
         print(f"Bad segments from 20% rule: {len(bad_segments)}")
@@ -1859,533 +1871,316 @@ def process_file(
         print(f"Final peaks: {len(peaks_final)}")
         print(f"Final RR intervals used for HR/HRV: {len(rr_final_cleaned)}")
 
-        # 10. Separate peak-correction and RR-processing diagnostic figures.
-        try:
-            if len(original_peaks) > 1:
-                plot_start = max(0, original_peaks[0] - 200)
-                ref_peak = original_peaks[min(len(original_peaks) - 1, 6)]
-                plot_end = min(len(ecg_filtered), ref_peak + 300)
-            else:
-                plot_start, plot_end = choose_plot_window(
-                    ecg_filtered,
-                    start=0,
-                    end=2000,
-                    fallback=2000
+        # 11. Final cleaned RR interval processing summary
+        #
+        # Main RR cleaning figure:
+        #
+        # Light blue line/dots = original RR intervals before cleaning
+        # Red X                = original RR intervals flagged by 20% rule
+        # Forest green line/dots = ALL final RR intervals after all processing
+        # Orange stars         = final RR intervals modified by interval correction
+        # Purple triangles     = final RR intervals involving an inserted R-peak
+        # Light red shading    = time segments removed by the 20% rule
+        #
+        # IMPORTANT:
+        # The green series is the COMPLETE final RR series used for HR/HRV.
+        # Orange/purple markers are optional overlays that identify which final
+        # intervals were changed by signal_fixpeaks.
+
+        original_rr = (
+            np.diff(original_peaks) / sampling_rate
+            if len(original_peaks) > 1
+            else np.array([])
+        )
+        original_rr_times = (
+            original_peaks[1:] / sampling_rate
+            if len(original_peaks) > 1
+            else np.array([])
+        )
+
+        final_rr = np.asarray(
+            rr_final_cleaned,
+            dtype=float
+        )
+        final_rr_times_plot = np.asarray(
+            rr_final_times,
+            dtype=float
+        )
+
+        inserted_peak_set = set(
+            np.asarray(
+                inserted_by_fixpeaks,
+                dtype=int
+            ).tolist()
+        )
+
+        # Recover the R-peak pair defining every retained final RR interval.
+        all_final_start_peaks = (
+            peaks_final[:-1]
+            if len(peaks_final) > 1
+            else np.array([], dtype=int)
+        )
+        all_final_end_peaks = (
+            peaks_final[1:]
+            if len(peaks_final) > 1
+            else np.array([], dtype=int)
+        )
+
+        final_start_peaks = all_final_start_peaks[
+            rr_gap_valid_mask
+        ]
+        final_end_peaks = all_final_end_peaks[
+            rr_gap_valid_mask
+        ]
+
+        # Identify final RR intervals involving an inserted R-peak.
+        final_rr_involves_inserted_peak = np.array(
+            [
+                (
+                    int(start_peak) in inserted_peak_set
+                    or int(end_peak) in inserted_peak_set
                 )
-
-            x = np.arange(plot_start, plot_end)
-
-            # --------------------------------------------------------------
-            # FIGURE A: Original versus final R-peaks
-            # --------------------------------------------------------------
-            fig_peaks, axes_peaks = plt.subplots(
-                2,
-                1,
-                figsize=(14, 7),
-                sharex=True,
-                constrained_layout=True
-            )
-
-            axes_peaks[0].plot(
-                x - plot_start,
-                ecg_filtered[plot_start:plot_end],
-                color='blue',
-                linewidth=1.0,
-                label='Filtered ECG'
-            )
-
-            orig_win = original_peaks[
-                (original_peaks >= plot_start)
-                & (original_peaks < plot_end)
-            ]
-
-            if len(orig_win) > 0:
-                axes_peaks[0].scatter(
-                    orig_win - plot_start,
-                    ecg_filtered[orig_win],
-                    color='red',
-                    s=34,
-                    label='Originally detected R-peaks',
-                    zorder=3
+                for start_peak, end_peak in zip(
+                    final_start_peaks,
+                    final_end_peaks
                 )
+            ],
+            dtype=bool
+        )
 
-            axes_peaks[0].set_title(
-                simple_title(
-                    subject,
-                    session,
-                    task,
-                    "Original R-Peaks Before 20% Rule"
-                )
+        # Match final RR intervals back to the original detected RR sequence.
+        # This lets us identify final intervals that changed because of
+        # signal_fixpeaks, while still plotting ALL final RR in green.
+        original_peak_index = {
+            int(peak): index
+            for index, peak in enumerate(original_peaks)
+        }
+
+        final_rr_matches_raw = np.zeros(
+            len(final_rr),
+            dtype=bool
+        )
+
+        rr_tolerance_sec = 1.0 / sampling_rate
+
+        for i, (
+            start_peak,
+            end_peak,
+            rr_value
+        ) in enumerate(
+            zip(
+                final_start_peaks,
+                final_end_peaks,
+                final_rr
             )
-            axes_peaks[0].set_ylabel("Voltage [mV]")
-            axes_peaks[0].legend(loc='upper right')
-            axes_peaks[0].grid(True, alpha=0.3)
-
-            axes_peaks[1].plot(
-                x - plot_start,
-                ecg_filtered[plot_start:plot_end],
-                color='blue',
-                linewidth=1.0,
-                label='Filtered ECG'
+        ):
+            start_index = original_peak_index.get(
+                int(start_peak)
             )
-
-            final_win = peaks_final[
-                (peaks_final >= plot_start)
-                & (peaks_final < plot_end)
-            ]
-
-            inserted_win = inserted_by_fixpeaks[
-                (inserted_by_fixpeaks >= plot_start)
-                & (inserted_by_fixpeaks < plot_end)
-            ]
-
-            final_original_win = np.setdiff1d(
-                final_win,
-                inserted_win,
-                assume_unique=False
-            )
-
-            if len(final_original_win) > 0:
-                axes_peaks[1].scatter(
-                    final_original_win - plot_start,
-                    ecg_filtered[final_original_win],
-                    color='green',
-                    s=34,
-                    label='Retained/corrected detected peaks',
-                    zorder=3
-                )
-
-            if len(inserted_win) > 0:
-                axes_peaks[1].scatter(
-                    inserted_win - plot_start,
-                    ecg_filtered[inserted_win],
-                    color='orange',
-                    marker='^',
-                    s=70,
-                    label='Peaks inserted by signal_fixpeaks',
-                    edgecolors='black',
-                    linewidths=0.4,
-                    zorder=5
-                )
-
-            axes_peaks[1].set_title(
-                simple_title(
-                    subject,
-                    session,
-                    task,
-                    "Final R-Peaks After 20% Removal and Interval Correction"
-                )
-            )
-            axes_peaks[1].set_xlabel("Samples Relative to Display Window")
-            axes_peaks[1].set_ylabel("Voltage [mV]")
-            axes_peaks[1].legend(loc='upper right')
-            axes_peaks[1].grid(True, alpha=0.3)
-
-            fig_peaks.suptitle(
-                simple_title(
-                    subject,
-                    session,
-                    task,
-                    "R-Peak Processing Diagnostic"
-                ),
-                fontsize=13,
-                fontweight='bold'
+            end_index = original_peak_index.get(
+                int(end_peak)
             )
 
-            finalize_and_save(
-                fig_peaks,
-                os.path.join(
-                    output_folder,
-                    f"{title_base}_rpeak_processing_diagnostic.png"
-                )
-            )
-
-            # --------------------------------------------------------------
-            # FIGURE B: RR audit plot showing exactly what changed
-            # --------------------------------------------------------------
-            original_rr = (
-                np.diff(original_peaks) / sampling_rate
-                if len(original_peaks) > 1
-                else np.array([])
-            )
-            original_rr_times = (
-                original_peaks[1:] / sampling_rate
-                if len(original_peaks) > 1
-                else np.array([])
-            )
-
-            # These are the exact gap-masked RR intervals used for HR and HRV.
-            final_rr = np.asarray(rr_final_cleaned, dtype=float)
-            final_rr_times = np.asarray(rr_final_times, dtype=float)
-
-            inserted_peak_set = set(
-                np.asarray(inserted_by_fixpeaks, dtype=int).tolist()
-            )
-
-            # Recover the final RR interval endpoint peaks after gap masking.
-            all_final_start_peaks = (
-                peaks_final[:-1]
-                if len(peaks_final) > 1
-                else np.array([], dtype=int)
-            )
-            all_final_end_peaks = (
-                peaks_final[1:]
-                if len(peaks_final) > 1
-                else np.array([], dtype=int)
-            )
-
-            final_start_peaks = all_final_start_peaks[rr_gap_valid_mask]
-            final_end_peaks = all_final_end_peaks[rr_gap_valid_mask]
-
-            # A final RR interval is "split by an inserted peak" if either
-            # endpoint was inserted by signal_fixpeaks.
-            final_rr_involves_inserted_peak = np.array(
-                [
-                    (
-                        int(start_peak) in inserted_peak_set
-                        or int(end_peak) in inserted_peak_set
-                    )
-                    for start_peak, end_peak in zip(
-                        final_start_peaks,
-                        final_end_peaks
-                    )
-                ],
-                dtype=bool
-            )
-
-            # Match each retained final RR back to the original raw RR sequence.
-
-            original_peak_index = {
-                int(peak): index
-                for index, peak in enumerate(original_peaks)
-            }
-
-            final_rr_matches_raw = np.zeros(len(final_rr), dtype=bool)
-            matched_raw_rr_index = np.full(len(final_rr), -1, dtype=int)
-            matched_raw_rr_sec = np.full(len(final_rr), np.nan, dtype=float)
-            rr_tolerance_sec = 1.0 / sampling_rate
-
-            for i, (start_peak, end_peak, rr_value) in enumerate(
-                zip(final_start_peaks, final_end_peaks, final_rr)
+            if (
+                start_index is not None
+                and end_index is not None
+                and end_index == start_index + 1
+                and start_index < len(original_rr)
             ):
-                start_index = original_peak_index.get(int(start_peak))
-                end_index = original_peak_index.get(int(end_peak))
+                raw_value = original_rr[start_index]
 
-                if (
-                    start_index is not None
-                    and end_index is not None
-                    and end_index == start_index + 1
-                    and start_index < len(original_rr)
-                ):
-                    raw_value = original_rr[start_index]
-                    matched_raw_rr_index[i] = start_index
-                    matched_raw_rr_sec[i] = raw_value
+                final_rr_matches_raw[i] = bool(
+                    np.isfinite(rr_value)
+                    and np.isfinite(raw_value)
+                    and abs(
+                        rr_value - raw_value
+                    ) <= rr_tolerance_sec
+                )
 
-                    final_rr_matches_raw[i] = bool(
-                        np.isfinite(rr_value)
-                        and np.isfinite(raw_value)
-                        and abs(rr_value - raw_value) <= rr_tolerance_sec
+        final_rr_modified_by_correction = (
+            ~final_rr_matches_raw
+            & ~final_rr_involves_inserted_peak
+        )
+
+        fig_rr, ax_rr = plt.subplots(
+            figsize=(16, 7),
+            constrained_layout=True
+        )
+
+        # ------------------------------------------------------------
+        # ORIGINAL RR BEFORE CLEANING
+        # Connect the original RR dots so sudden artifacts are easy to see.
+        # ------------------------------------------------------------
+        if len(original_rr) > 0:
+            ax_rr.plot(
+                original_rr_times,
+                original_rr,
+                color='cornflowerblue',
+                linewidth=0.8,
+                marker='o',
+                markersize=3.2,
+                alpha=0.50,
+                label='Original RR before cleaning',
+                zorder=2
+            )
+
+        # ------------------------------------------------------------
+        # ORIGINAL RR REMOVED BY 20% RULE
+        # ------------------------------------------------------------
+        if len(invalid_indices) > 0 and len(original_rr) > 0:
+            valid_invalid_indices = invalid_indices[
+                invalid_indices < len(original_rr)
+            ]
+
+            ax_rr.scatter(
+                original_rr_times[
+                    valid_invalid_indices
+                ],
+                original_rr[
+                    valid_invalid_indices
+                ],
+                color='red',
+                marker='x',
+                s=70,
+                linewidths=1.8,
+                label='RR removed by 20% rule',
+                zorder=7
+            )
+
+        # ------------------------------------------------------------
+        # ALL FINAL RR AFTER ALL PROCESSING
+        #
+        # Break the connecting green line across removed/bad gaps rather than
+
+        # ------------------------------------------------------------
+        if len(final_rr) > 0:
+            final_line_times = []
+            final_line_rr = []
+
+            for i in range(len(final_rr)):
+                if i > 0:
+                    time_gap = (
+                        final_rr_times_plot[i]
+                        - final_rr_times_plot[i - 1]
                     )
 
-            # Final RR classification used in the audit plot:
-            #   green circle  = unchanged from raw
-            #   purple triangle = interval involves an inserted R-peak
-            #   orange star   = changed from raw without an inserted endpoint
-            final_rr_unchanged = (
-                final_rr_matches_raw
-                & ~final_rr_involves_inserted_peak
-            )
-            final_rr_split_by_inserted_peak = (
-                final_rr_involves_inserted_peak
-            )
-            final_rr_modified_by_correction = (
-                ~final_rr_matches_raw
-                & ~final_rr_involves_inserted_peak
-            )
+                    # A gap larger than the maximum accepted RR indicates an
+                    # excluded portion of the task. Insert NaNs so matplotlib
+                    # breaks the line rather than connecting across the gap.
+                    if time_gap > MAX_RR_FOR_INTERPOLATION:
+                        final_line_times.append(np.nan)
+                        final_line_rr.append(np.nan)
 
-            fig_audit, ax_audit = plt.subplots(
-                figsize=(16, 7),
-                constrained_layout=True
-            )
-
-            # Plot all original RR intervals first in light gray.
-            if len(original_rr) > 0:
-                ax_audit.plot(
-                    original_rr_times,
-                    original_rr,
-                    color='gray',
-                    linewidth=0.7,
-                    marker='o',
-                    markersize=4,
-                    alpha=0.45,
-                    label='Original RR',
-                    zorder=1
+                final_line_times.append(
+                    final_rr_times_plot[i]
+                )
+                final_line_rr.append(
+                    final_rr[i]
                 )
 
-            # Mark original RR intervals removed by the 20% rule.
-            if len(invalid_indices) > 0 and len(original_rr) > 0:
-                valid_invalid_indices = invalid_indices[
-                    invalid_indices < len(original_rr)
-                ]
-
-                ax_audit.scatter(
-                    original_rr_times[valid_invalid_indices],
-                    original_rr[valid_invalid_indices],
-                    color='red',
-                    marker='x',
-                    s=70,
-                    linewidths=1.8,
-                    label='RR removed by 20% rule',
-                    zorder=7
-                )
-
-            # Final unchanged RR intervals.
-            if np.any(final_rr_unchanged):
-                ax_audit.scatter(
-                    final_rr_times[final_rr_unchanged],
-                    final_rr[final_rr_unchanged],
-                    color='green',
-                    marker='o',
-                    s=28,
-                    label='Final RR unchanged from raw',
-                    zorder=4
-                )
-
-            # Final intervals changed by correction/removal, but without an
-            # inserted endpoint.
-            if np.any(final_rr_modified_by_correction):
-                ax_audit.scatter(
-                    final_rr_times[final_rr_modified_by_correction],
-                    final_rr[final_rr_modified_by_correction],
-                    color='orange',
-                    marker='*',
-                    s=105,
-                    edgecolors='black',
-                    linewidths=0.35,
-                    label='Final RR modified by correction',
-                    zorder=5
-                )
-
-            # Final intervals created/split around an inserted peak.
-            if np.any(final_rr_split_by_inserted_peak):
-                ax_audit.scatter(
-                    final_rr_times[final_rr_split_by_inserted_peak],
-                    final_rr[final_rr_split_by_inserted_peak],
-                    color='purple',
-                    marker='^',
-                    s=78,
-                    edgecolors='black',
-                    linewidths=0.35,
-                    label='Final RR split by inserted R-peak',
-                    zorder=6
-                )
-
-            # Shade bad segments so removed time periods remain visible.
-            bad_label_used = False
-            for seg in bad_segments:
-                ax_audit.axvspan(
-                    seg["start_sec"],
-                    seg["end_sec"],
-                    color='red',
-                    alpha=0.08,
-                    label=(
-                        'Removed bad segment'
-                        if not bad_label_used
-                        else None
-                    ),
-                    zorder=0
-                )
-                bad_label_used = True
-
-            ax_audit.set_title(
-                simple_title(
-                    subject,
-                    session,
-                    task,
-                    "RR Audit: Original, Removed, Unchanged, Modified, and Inserted"
-                )
-            )
-            ax_audit.set_xlabel("Task Time After bas+ (seconds)")
-            ax_audit.set_ylabel("RR Interval (seconds)")
-            ax_audit.set_ylim(0, 2)
-            ax_audit.grid(True, alpha=0.3)
-            ax_audit.legend(loc='upper right')
-
-            finalize_and_save(
-                fig_audit,
-                os.path.join(
-                    output_folder,
-                    f"{title_base}_rr_processing_audit.png"
-                )
-            )
-
-            if len(final_rr) > 0:
-                pd.DataFrame({
-                    "final_rr_index": np.arange(len(final_rr)),
-                    "final_rr_time_sec": final_rr_times,
-                    "final_rr_interval_sec": final_rr,
-                    "start_peak_sample": final_start_peaks,
-                    "end_peak_sample": final_end_peaks,
-                    "start_peak_was_inserted": [
-                        int(value) in inserted_peak_set
-                        for value in final_start_peaks
-                    ],
-                    "end_peak_was_inserted": [
-                        int(value) in inserted_peak_set
-                        for value in final_end_peaks
-                    ],
-                    "rr_involves_inserted_peak": (
-                        final_rr_involves_inserted_peak
-                    ),
-                    "matched_raw_rr_index": matched_raw_rr_index,
-                    "matched_raw_rr_interval_sec": matched_raw_rr_sec,
-                    "final_rr_matches_raw": final_rr_matches_raw,
-                    "audit_class": np.select(
-                        [
-                            final_rr_split_by_inserted_peak,
-                            final_rr_modified_by_correction,
-                            final_rr_unchanged
-                        ],
-                        [
-                            "split_by_inserted_rpeak",
-                            "modified_by_correction",
-                            "unchanged_from_raw"
-                        ],
-                        default="unclassified"
-                    )
-                }).to_csv(
-                    os.path.join(
-                        output_folder,
-                        f"{title_base}_final_rr_audit.csv"
-                    ),
-                    index=False
-                )
-
-
-        except Exception as e:
-            save_placeholder_plot(
-                os.path.join(
-                    output_folder,
-                    f"{title_base}_rpeak_processing_diagnostic.png"
-                ),
-                simple_title(
-                    subject,
-                    session,
-                    task,
-                    "R-Peak Processing Diagnostic"
-                ),
-                f"Could not create R-peak processing diagnostic: {e}"
-            )
-
-            save_placeholder_plot(
-                os.path.join(
-                    output_folder,
-                    f"{title_base}_rr_processing_audit.png"
-                ),
-                simple_title(
-                    subject,
-                    session,
-                    task,
-                    "Raw RR vs Final RR"
-                ),
-                f"Could not create RR processing diagnostic: {e}"
-            )
-
-
-        # 11. Cleaned RR intervals
-
-        rr_cleaned = rr_final_cleaned
-
-        fig, ax = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
-
-        if len(rr_raw) > 0:
-            # Plot RR after signal_fixpeaks, but do not connect intervals removed by the 20% rule.
-            rr_20pct_plot = rr_raw.astype(float).copy()
-            rr_20pct_plot[~rr_valid_mask_20pct] = np.nan
-            ax.plot(
-                np.arange(len(rr_20pct_plot)),
-                rr_20pct_plot,
+            ax_rr.plot(
+                np.asarray(final_line_times),
+                np.asarray(final_line_rr),
+                color='forestgreen',
+                linewidth=0.9,
                 marker='o',
-                linestyle='-',
-                label='Original RR after 20% rule',
-                markersize=4,
-                alpha=0.6
+                markersize=3.8,
+                alpha=0.90,
+                label='Final RR',
+                zorder=4
             )
 
-            if len(invalid_indices) > 0:
-                ax.scatter(
-                    invalid_indices,
-                    rr_raw[invalid_indices],
-                    color='red',
-                    marker='x',
-                    s=45,
-                    label='Removed by 20% change rule',
-                    zorder=4
-                )
-
-        if len(rr_final_cleaned) > 0:
-            ax.plot(
-                np.arange(len(rr_final_cleaned)),
-                rr_final_cleaned,
-                marker='o',
-                linestyle='None',
-                color='green',
-                label='Final RR after interval correction, used for HR/HRV',
-                markersize=4
+        # ------------------------------------------------------------
+        # OPTIONAL: FINAL RR MODIFIED BY INTERVAL CORRECTION
+        # ------------------------------------------------------------
+        if np.any(final_rr_modified_by_correction):
+            ax_rr.scatter(
+                final_rr_times_plot[
+                    final_rr_modified_by_correction
+                ],
+                final_rr[
+                    final_rr_modified_by_correction
+                ],
+                color='orange',
+                marker='*',
+                s=105,
+                edgecolors='black',
+                linewidths=0.35,
+                label='Final RR modified by interval correction',
+                zorder=6
             )
 
-        ax.set_title(simple_title(subject, session, task, "Final Cleaned RR Intervals"))
-        ax.set_xlabel("RR Interval Index")
-        ax.set_ylabel("RR Interval (s)")
-        ax.set_ylim(0, 2)
-        ax.legend(loc='upper left')
-        ax.grid(True, alpha=0.3)
-        finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_cleaned_rr_intervals.png"))
-
-        # 12. Last 10 beats
-        if len(peaks_final) >= 2:
-            last10_peaks = peaks_final[-min(10, len(peaks_final)):]
-            start_idx = max(0, last10_peaks[0] - 200)
-            end_idx = min(len(ecg_filtered), last10_peaks[-1] + 200)
-            ecg_window = ecg_filtered[start_idx:end_idx]
-            peaks_in_window = last10_peaks - start_idx
-
-            fig, ax = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
-            ax.plot(ecg_window, color='red', label='Filtered ECG')
-            ax.plot(peaks_in_window, ecg_window[peaks_in_window], 'bo', label='R-peaks', markersize=6)
-            ax.set_title(simple_title(subject, session, task, "Filtered ECG - Last 10 R-Peaks"))
-            ax.set_xlabel("Samples [N]")
-            ax.set_ylabel("Amplitude [mV]")
-            ax.legend(loc='lower right')   # requested
-            ax.grid(True, alpha=0.3)
-            finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_last10_beats.png"))
-        else:
-            save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_last10_beats.png"),
-                simple_title(subject, session, task, "Filtered ECG - Last 10 R-Peaks"),
-                "Not enough peaks to plot last 10 beats."
+        # ------------------------------------------------------------
+        # OPTIONAL: FINAL RR INVOLVING AN INSERTED R-PEAK
+        # ------------------------------------------------------------
+        if np.any(final_rr_involves_inserted_peak):
+            ax_rr.scatter(
+                final_rr_times_plot[
+                    final_rr_involves_inserted_peak
+                ],
+                final_rr[
+                    final_rr_involves_inserted_peak
+                ],
+                color='purple',
+                marker='^',
+                s=78,
+                edgecolors='black',
+                linewidths=0.35,
+                label='Final RR involving inserted R-peak',
+                zorder=7
             )
 
-        # 13. EDR
-        try:
-            ecg_rate_edr = nk.signal_rate(peaks_final, sampling_rate=sampling_rate, desired_length=len(ecg_filtered))
-            methods = ['vangent2019', 'soni2019', 'charlton2016', 'sarkar2015']
-            fig, axes = plt.subplots(len(methods), 1, figsize=(18, 10), sharex=True, constrained_layout=True)
-            for i, method in enumerate(methods):
-                edr = nk.ecg_rsp(ecg_rate_edr, sampling_rate=sampling_rate, method=method)
-                axes[i].plot(edr, lw=0.8, color='blue')
-                axes[i].set_title(f"EDR - {method}")
-                axes[i].set_ylabel("Amplitude [mV]")
-                axes[i].grid(True, alpha=0.3)
-            axes[-1].set_xlabel("Samples [N]")
-            fig.suptitle(simple_title(subject, session, task, "ECG-Derived Respiration (EDR)"), fontsize=13, fontweight='bold')
-            finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_EDR.png"))
-        except Exception as e:
-            save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_EDR.png"),
-                simple_title(subject, session, task, "ECG-Derived Respiration (EDR)"),
-                f"Could not compute EDR: {e}"
+        # ------------------------------------------------------------
+        # REMOVED TIME SEGMENTS
+        # ------------------------------------------------------------
+        bad_label_used = False
+
+        for seg in bad_segments:
+            ax_rr.axvspan(
+                seg["start_sec"],
+                seg["end_sec"],
+                color='red',
+                alpha=0.08,
+                label=(
+                    'Removed bad segment'
+                    if not bad_label_used
+                    else None
+                ),
+                zorder=0
             )
+            bad_label_used = True
+
+        ax_rr.set_title(
+            simple_title(
+                subject,
+                session,
+                task,
+                "Final Cleaned RR Intervals"
+            )
+        )
+        ax_rr.set_xlabel(
+            "Task Time After bas+ (seconds)"
+        )
+        ax_rr.set_ylabel(
+            "RR Interval (seconds)"
+        )
+        ax_rr.set_ylim(0, 2)
+        ax_rr.set_xlim(
+            0,
+            len(ecg_filtered) / sampling_rate
+        )
+        ax_rr.grid(True, alpha=0.3)
+        ax_rr.legend(loc='upper right')
+
+        finalize_and_save(
+            fig_rr,
+            os.path.join(
+                png_folder,
+                f"{title_base}_cleaned_rr_intervals.png"
+            )
+        )
+
+
 
         # 14. ECG delineation
         try:
@@ -2398,14 +2193,14 @@ def process_file(
             fig.set_size_inches(18, 8)
             ax = fig.axes[0]
             ax.set_title(simple_title(subject, session, task, "ECG Delineation"))
-            ax.set_xlabel("Time [Seconds]")
+            ax.set_xlabel("Time Center on Rpeaks (seconds)")
             ax.set_ylabel("Amplitude [mV]")
             if ax.get_legend() is not None:
                 ax.legend(loc='upper right', bbox_to_anchor=(1.02, 1))
-            finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_delineation.png"))
+            finalize_and_save(fig, os.path.join(png_folder, f"{title_base}_delineation.png"))
         except Exception as e:
             save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_delineation.png"),
+                os.path.join(png_folder, f"{title_base}_delineation.png"),
                 simple_title(subject, session, task, "ECG Delineation"),
                 f"Could not compute delineation: {e}"
             )
@@ -2452,7 +2247,7 @@ def process_file(
         ax.set_ylabel("Heart Rate (bpm)")
         ax.legend(loc='upper right')
         ax.grid(True, alpha=0.3)
-        finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_heart_rate.png"))
+        finalize_and_save(fig, os.path.join(png_folder, f"{title_base}_heart_rate.png"))
 
 
 
@@ -2474,7 +2269,6 @@ def process_file(
         valid_rr_intervals = rr_plot_by_time[valid_indices]
 
         if len(valid_rr_times) > 1:
-            # nk.signal_interpolate takes the old X, old Y, and the target new X grid.
             # We use method='cubic' to get a smooth physiological curve.
             rr_interpolated = nk.signal_interpolate(
                 x_values=valid_rr_times,
@@ -2482,7 +2276,7 @@ def process_file(
                 x_new=sample_times,
                 method='cubic'
             )
-
+            
             # Re-mask the bad segments so the line breaks visually over noise blocks
             for seg in bad_segments:
                 mask_gap = (sample_times >= seg["start_sec"]) & (sample_times <= seg["end_sec"])
@@ -2559,7 +2353,6 @@ def process_file(
         ax2.set_ylabel("Heart Rate (bpm)", color='crimson')
         ax2.tick_params(axis='y', labelcolor='crimson')
 
-        # PI-requested HR axis: start at 0 bpm and use 25-bpm increments.
         finite_hr = hr_from_interpolated_rr[np.isfinite(hr_from_interpolated_rr)]
         if len(finite_hr) > 0:
             hr_axis_max = max(175, int(np.ceil(np.nanmax(finite_hr) / 25.0) * 25))
@@ -2574,7 +2367,7 @@ def process_file(
         ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
         ax1.set_title(simple_title(subject, session, task, "Final RR Intervals vs Heart Rate"))
         ax1.grid(True, alpha=0.3)
-        finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_rr_vs_hr.png"))
+        finalize_and_save(fig, os.path.join(png_folder, f"{title_base}_rr_vs_hr.png"))
 
 
 
@@ -2585,89 +2378,82 @@ def process_file(
             fig = plt.gcf()
             if figure_has_content(fig):
                 fig.set_size_inches(16, 6)
-                finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_segmented_heartbeat.png"))
+                ax = fig.axes[0]
+                ax.set_xlabel("Time Center on Rpeaks (seconds)")
+                ax.set_ylabel("Amplitude (mV)")
+                ax.set_xlim(-0.2, 0.2)
+                finalize_and_save(fig, os.path.join(png_folder, f"{title_base}_segmented_heartbeat.png"))
             else:
                 plt.close(fig)
                 save_placeholder_plot(
-                    os.path.join(output_folder, f"{title_base}_segmented_heartbeat.png"),
+                    os.path.join(png_folder, f"{title_base}_segmented_heartbeat.png"),
                     simple_title(subject, session, task, "ECG Segmentation"),
                     "ECG segmentation ran, but NeuroKit did not create a visible figure for this file."
                 )
         except Exception as e:
             save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_segmented_heartbeat.png"),
+                os.path.join(png_folder, f"{title_base}_segmented_heartbeat.png"),
                 simple_title(subject, session, task, "ECG Segmentation"),
                 f"Could not segment heartbeats: {e}"
             )
 
         plt.close('all')
 
-        # 18. HRV default
-        try:
-            nk.hrv(peaks_for_hrv, sampling_rate=sampling_rate, show=True)
-            fig_hrv = plt.gcf()
-            if figure_has_content(fig_hrv):
-                fig_hrv.set_size_inches(*HRV_FIG)
-                try:
-                    fig_hrv.tight_layout(rect=(0, 0, 1, 0.97))
-                except Exception:
-                    pass
-                fig_hrv.savefig(os.path.join(output_folder, f"{title_base}_HRV_Default.png"), bbox_inches='tight', dpi=150)
-                axes_hrv = fig_hrv.get_axes()
-            else:
-                axes_hrv = []
-                plt.close(fig_hrv)
-                save_placeholder_plot(
-                    os.path.join(output_folder, f"{title_base}_HRV_Default.png"),
-                    simple_title(subject, session, task, "HRV Default"),
-                    "HRV calculation ran, but NeuroKit did not create a visible figure for this file."
-                )
-        except Exception as e:
-            axes_hrv = []
-            save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_HRV_Default.png"),
-                simple_title(subject, session, task, "HRV Default"),
-                f"Could not compute HRV default plot: {e}"
-            )
 
         # 18. B. HRV Time Domain Metrics
+        mean_nn = np.nan
+        sdnn = np.nan
+        rmssd = np.nan
+        median_nn = np.nan
+
         try:
-            # Capture the results in a DataFrame
             hrv_time_df = nk.hrv_time(peaks_for_hrv, sampling_rate=sampling_rate, show=True)
             fig_hrv_time = plt.gcf()
-
+            
             if figure_has_content(fig_hrv_time):
-                # Extract the metrics
                 mean_nn = hrv_time_df['HRV_MeanNN'].values[0]
                 sdnn = hrv_time_df['HRV_SDNN'].values[0]
                 rmssd = hrv_time_df['HRV_RMSSD'].values[0]
                 median_nn = hrv_time_df['HRV_MedianNN'].values[0]
-
-                # Print to console
+                
                 print(f"Subject {subject} - HRV Time Domain -> MeanNN: {mean_nn:.2f}, SDNN: {sdnn:.2f}, RMSSD: {rmssd:.2f}, MedianNN: {median_nn:.2f}")
 
-                # Add metrics to the figure
                 ax = fig_hrv_time.axes[0]
+                ax.set_ylabel("Count")
                 text_str = (f"MeanNN   : {mean_nn:>8.2f} ms\n"
                             f"SDNN     : {sdnn:>8.2f} ms\n"
                             f"RMSSD    : {rmssd:>8.2f} ms\n"
                             f"MedianNN : {median_nn:>8.2f} ms")
-
-                ax.text(0.98, 0.98, text_str, transform=ax.transAxes, 
-                        fontsize=10, verticalalignment='top', horizontalalignment='right',
-                        fontfamily='monospace',
-                        bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+                
+                ax.text(
+                    0.97,
+                    0.97,
+                    text_str,
+                    transform=ax.transAxes,
+                    fontsize=13,
+                    verticalalignment='top',
+                    horizontalalignment='right',
+                    fontfamily='monospace',
+                    linespacing=1.35,
+                    bbox=dict(
+                        boxstyle='round,pad=0.65',
+                        facecolor='white',
+                        edgecolor='gray',
+                        linewidth=1.0,
+                        alpha=0.90
+                    )
+                )
 
                 fig_hrv_time.set_size_inches(*HRV_FIG)
                 try:
                     fig_hrv_time.tight_layout(rect=(0, 0, 1, 0.97))
                 except Exception:
                     pass
-                fig_hrv_time.savefig(os.path.join(output_folder, f"{title_base}_HRV_TimeDomain.png"), bbox_inches='tight', dpi=150)
+                fig_hrv_time.savefig(os.path.join(png_folder, f"{title_base}_HRV_TimeDomain.png"), bbox_inches='tight', dpi=150)
             else:
                 plt.close(fig_hrv_time)
                 save_placeholder_plot(
-                    os.path.join(output_folder, f"{title_base}_HRV_TimeDomain.png"),
+                    os.path.join(png_folder, f"{title_base}_HRV_TimeDomain.png"),
                     simple_title(subject, session, task, "HRV Time Domain Metrics"),
                     "HRV time-domain metrics ran, butdid not create a visible figure."
                 )
@@ -2675,7 +2461,7 @@ def process_file(
         except Exception as e:
             plt.close('all')
             save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_HRV_TimeDomain.png"),
+                os.path.join(png_folder, f"{title_base}_HRV_TimeDomain.png"),
                 simple_title(subject, session, task, "HRV Time Domain Metrics"),
                 f"Could not compute HRV time-domain metrics plot: {e}"
             )
@@ -2703,23 +2489,13 @@ def process_file(
                 'VHF': ((freqs >= 0.4) & (freqs < 2.0), 'red'),
             }
 
-            fig, ax = plt.subplots(figsize=(14, 6), constrained_layout=True)
-            for label, (mask, colour) in bands.items():
-                if np.any(mask):
-                    ax.fill_between(freqs[mask], psd[mask], color=colour, alpha=0.8, label=label)
-            ax.set_xlim(0, 2.0)
-            ax.set_ylim(bottom=0)
-            ax.set_title(simple_title(subject, session, task, "4 Hz Resampled PSD"))
-            ax.set_xlabel('Frequency (Hz)')
-            ax.set_ylabel('Spectrum (ms²/Hz)')
-            ax.legend(loc='upper right')
-            ax.grid(True, alpha=0.3)
-            finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_standalone_4hz_psd.png"))
 
 
             try:
                 nk.hrv(peaks_for_hrv, sampling_rate=sampling_rate, show=True)
                 fig_hrv_new = plt.gcf()
+                ax_rr_distribution = fig.axes[0]
+                ax_rr_distribution.set_ylabel("Count")
 
                 if figure_has_content(fig_hrv_new) and len(fig_hrv_new.get_axes()) > 1:
                     fig_hrv_new.set_size_inches(*HRV_FIG)
@@ -2744,7 +2520,7 @@ def process_file(
                     ax_psd.set_ylim(bottom=0)
                     ax_psd.set_title('Power Spectral Density (PSD) for Frequency Domains')
                     ax_psd.set_xlabel('Frequency (Hz)')
-                    ax_psd.set_ylabel('Spectrum (ms²/Hz)')
+                    ax_psd.set_ylabel('Power Spectral Density (ms²/Hz)')
                     ax_psd.legend(loc='upper right', fontsize=8)
                     ax_psd.grid(True, alpha=0.3)
 
@@ -2754,7 +2530,7 @@ def process_file(
                         pass
 
                     fig_hrv_new.savefig(
-                        os.path.join(output_folder, f"{title_base}_HRV_new_metrics.png"),
+                        os.path.join(png_folder, f"{title_base}_HRV_new_metrics.png"),
                         bbox_inches='tight',
                         dpi=150
                     )
@@ -2763,33 +2539,25 @@ def process_file(
                 else:
                     plt.close(fig_hrv_new)
                     save_placeholder_plot(
-                        os.path.join(output_folder, f"{title_base}_HRV_new_metrics.png"),
+                        os.path.join(png_folder, f"{title_base}_HRV_new_metrics.png"),
                         simple_title(subject, session, task, "HRV New Metrics"),
                         "NeuroKit HRV figure did not contain the expected axes, so the combined HRV plot could not be created."
                     )
 
             except Exception as e:
                 save_placeholder_plot(
-                    os.path.join(output_folder, f"{title_base}_HRV_new_metrics.png"),
+                    os.path.join(png_folder, f"{title_base}_HRV_new_metrics.png"),
                     simple_title(subject, session, task, "HRV New Metrics"),
                     f"Could not create full HRV new metrics plot: {e}"
                 )
 
         except Exception as e:
             save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_standalone_4hz_psd.png"),
-                simple_title(subject, session, task, "4 Hz Resampled PSD"),
-                f"Could not compute standalone 4 Hz PSD: {e}"
-            )
-            save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_HRV_new_metrics.png"),
+                os.path.join(png_folder, f"{title_base}_HRV_new_metrics.png"),
                 simple_title(subject, session, task, "HRV New Metrics"),
                 f"Could not compute modified HRV plot: {e}"
             )
-
-
-
-
+        
 
 
 
@@ -2810,7 +2578,7 @@ def process_file(
 
             # Create a copy to explicitly zero out/flatten the edges
             ecg_window_masked = ecg_filtered_full.copy()
-
+            
             # Set everything before bas+ and after TRSP to exactly 0 (or np.nan if you want gaps)
             ecg_window_masked[:task_start_sample] = 0
             ecg_window_masked[task_end_sample:] = 0
@@ -2819,11 +2587,11 @@ def process_file(
             full_recording_times = np.arange(len(ecg_filtered_full)) / sampling_rate
 
             fig, ax = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
-
+            
             # Plot the masked signal across the entire chronological timeline
             ax.plot(full_recording_times, ecg_window_masked, color='blue', lw=0.8, 
                     label='Isolated Experimental Window (bas+ to TRSP)')
-
+            
             # Add visual boundary markers for clarity
 
             if 'bgin_marker_sec' in locals() and bgin_marker_sec is not None:
@@ -2834,6 +2602,18 @@ def process_file(
                     linewidth=1.5,
                     label=f'bgin ({bgin_marker_sec:.2f}s)',
                     zorder=4
+                )
+
+            
+            if marker_start_sec is not None:
+                ax.axvline(
+                    marker_start_sec,
+                    color='red',
+                    linestyle='--',
+                    linewidth=1.5,
+                    alpha=0.95,
+                    label=f'bas+ ({marker_start_sec:.2f}s)',
+                    zorder=5
                 )
 
             if 'din3_marker_sec' in locals() and din3_marker_sec is not None:
@@ -2847,8 +2627,42 @@ def process_file(
                     zorder=6
                 )
 
+            if marker_end_sec is not None:
+                ax.axvline(marker_end_sec, color='black', linestyle='-.', alpha=0.7, 
+                            label=f'TRSP ({marker_end_sec:.2f}s)')
+
+            ax.ticklabel_format(style='sci', axis='y', scilimits=(0, 0))
+            ax.set_title(simple_title(subject, session, task, "Isolation Window for Filtered ECG Signal (Zero Arrays Added)"))
+            ax.set_xlabel("Full Session Time (seconds)")
+            ax.set_ylabel("Amplitude [mV]")
+            ax.set_xlim(0, full_duration_sec)
+            ax.grid(True, alpha=0.3)
+            handles, labels = ax.get_legend_handles_labels()
+            priority = ['Isolated Experimental Window (bas+ to TRSP)', 'bgin', 'bas+', 'DIN3', 'TRSP']
+            ordered = sorted(zip(handles, labels), key=lambda item: next((i for i, key in enumerate(priority) if item[1].startswith(key)), len(priority)))
+            if ordered:
+                ordered_handles, ordered_labels = zip(*ordered)
+                ax.legend(ordered_handles, ordered_labels, loc='upper right')
+            
+            finalize_and_save(fig, os.path.join(png_folder, f"{title_base}_filtered_task_window_isolated.png"))
+
+
+
+        # PLOT 2: Zoomed-In View (Beginning Timeline Focus) ---
+            # ------------------------------------------------------------
+            fig_zoom, ax_zoom = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
+            
+            # Plot the same underlying data
+            ax_zoom.plot(full_recording_times, ecg_window_masked, color='blue', lw=1.0, 
+                            label='Isolated Experimental Window')
+            
+            # Re-draw the vertical markers
+            if 'bgin_marker_sec' in locals() and bgin_marker_sec is not None:
+                ax_zoom.axvline(bgin_marker_sec, color='black', linestyle=':', linewidth=2.0, alpha=0.9,
+                                label=f'bgin ({bgin_marker_sec:.2f}s)')
+
             if marker_start_sec is not None:
-                ax.axvline(
+                ax_zoom.axvline(
                     marker_start_sec,
                     color='red',
                     linestyle='--',
@@ -2857,34 +2671,6 @@ def process_file(
                     label=f'bas+ ({marker_start_sec:.2f}s)',
                     zorder=5
                 )
-            if marker_end_sec is not None:
-                ax.axvline(marker_end_sec, color='black', linestyle='-.', alpha=0.7, 
-                           label=f'TRSP ({marker_end_sec:.2f}s)')
-
-            ax.ticklabel_format(style='sci', axis='y', scilimits=(0, 0))
-            ax.set_title(simple_title(subject, session, task, "Isolation Window (Zero Arrays Added) Simulated Full Filtered ECG Signal"))
-            ax.set_xlabel("Absolute Session Time (seconds)")
-            ax.set_ylabel("Amplitude [mV]")
-            ax.set_xlim(0, full_duration_sec)
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc='upper right')
-
-            finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_filtered_task_window_isolated.png"))
-
-
-
-        # PLOT 2: Zoomed-In View (Beginning Timeline Focus) ---
-            # ------------------------------------------------------------
-            fig_zoom, ax_zoom = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
-
-            # Plot the same underlying data
-            ax_zoom.plot(full_recording_times, ecg_window_masked, color='blue', lw=1.0, 
-                         label='Isolated Experimental Window')
-
-            # Re-draw the vertical markers
-            if 'bgin_marker_sec' in locals() and bgin_marker_sec is not None:
-                ax_zoom.axvline(bgin_marker_sec, color='black', linestyle=':', linewidth=2.0, alpha=0.9,
-                                label=f'bgin ({bgin_marker_sec:.2f}s)')
 
             if 'din3_marker_sec' in locals() and din3_marker_sec is not None:
                 ax_zoom.axvline(
@@ -2896,22 +2682,13 @@ def process_file(
                     label=f'DIN3 ({din3_marker_sec:.2f}s)',
                     zorder=6
                 )
-            if marker_start_sec is not None:
-                ax_zoom.axvline(
-                    marker_start_sec,
-                    color='red',
-                    linestyle='--',
-                    linewidth=1.5,
-                    alpha=0.95,
-                    label=f'bas+ ({marker_start_sec:.2f}s)',
-                    zorder=5
-                )
+
 
             # Focus the X-axis strictly from 3 seconds before the start marker and 5 seconds past the start marker
             zoom_start_x = marker_start_sec - 3 if marker_start_sec is not None else 0.0
             zoom_end_x = (marker_start_sec + 5) if marker_start_sec is not None else 30.0
             ax_zoom.set_xlim(zoom_start_x, zoom_end_x)
-
+            
             # Dynamically adjust Y-limits to fit only the signal data visible inside this zoom window
             visible_indices = (full_recording_times >= zoom_start_x) & (full_recording_times <= zoom_end_x)
             if np.any(visible_indices):
@@ -2967,196 +2744,359 @@ def process_file(
 
             ax_zoom.ticklabel_format(style='sci', axis='y', scilimits=(0, 0))
             ax_zoom.set_title(simple_title(subject, session, task, "Task Isolation Window - Zoomed Beginning (bgin / bas+ / DIN3)"))
-            ax_zoom.set_xlabel("Absolute Session Time (seconds)")
+            ax_zoom.set_xlabel("Full Session Time (seconds)")
             ax_zoom.set_ylabel("Amplitude [mV]")
             ax_zoom.grid(True, alpha=0.3)
-            ax_zoom.legend(loc='upper left')
-
-            finalize_and_save(fig_zoom, os.path.join(output_folder, f"{title_base}_filtered_task_window_isolated_zoom.png"))
-
+            handles, labels = ax_zoom.get_legend_handles_labels()
+            priority = ['Isolated Experimental Window', 'bgin', 'bas+', 'DIN3']
+            ordered = sorted(zip(handles, labels), key=lambda item: next((i for i, key in enumerate(priority) if item[1].startswith(key)), len(priority)))
+            if ordered:
+                ordered_handles, ordered_labels = zip(*ordered)
+                ax_zoom.legend(ordered_handles, ordered_labels, loc='upper left')
+            
+            finalize_and_save(fig_zoom, os.path.join(png_folder, f"{title_base}_filtered_task_window_isolated_zoom.png"))
+            
         except Exception as e:
             save_placeholder_plot(
-                os.path.join(output_folder, f"{title_base}_filtered_task_window_isolated.png"),
+                os.path.join(png_folder, f"{title_base}_filtered_task_window_isolated.png"),
                 simple_title(subject, session, task, "Filtered ECG - Isolated Window"),
                 f"Could not compute or plot session-wide isolated task window: {e}"
             )
 
         ########################################################################
-        ########################################################################
 
-        # Total duration of the analyzed task window.
-        # bad_segments are task-relative, so the denominator should use the task duration.
+
+
+        # 20. Usable epoch from 20% RR-change bad segments
+        # ------------------------------------------------------------
+        # The old 0.95 template-quality report has been removed.
+        # Usable epoch is now based ONLY on the time removed by the
+        # 20% RR-change bad-segment rule.
+
         total_duration = len(ecg_raw) / sampling_rate
 
-        # Sum up the exact duration of the segments 
-        total_red_gaps_sec = sum(seg["end_sec"] - seg["start_sec"] for seg in bad_segments)
+        total_red_gaps_sec = sum(
+            seg["end_sec"] - seg["start_sec"]
+            for seg in bad_segments
+        )
 
-        # Calculate the Usable Epoch Percentage 
         if total_duration > 0:
-            usable_epoch_pct = ((total_duration - total_red_gaps_sec) / total_duration) * 100
+            usable_epoch_pct = (
+                (total_duration - total_red_gaps_sec)
+                / total_duration
+            ) * 100
         else:
             usable_epoch_pct = 0.0
 
-        print(f"Usable Epoch: {usable_epoch_pct:.2f}%")
-        ##########################################################################
-
-
-
-
-
-
-
-        plt.close('all')
-
-        # 20. Combined Summary Report Figure
-        n_data_rows = 3 + 8 + 3 + 2 + len(onsets) + 1
-        fig_height = 1.0 + n_data_rows * 0.4
-        fig, ax = plt.subplots(figsize=(TABLE_WIDTH, fig_height))
-        ax.axis('off')
-
-        if high_quality_pct > 95:
-            status = "Excellent - Signal is highly reliable for analysis."
-        elif high_quality_pct > 80:
-            status = "Good - Majority of signal is usable."
-        else:
-            status = "Caution - Significant noise detected."
-
-        rows = []
-        rows.append(["RECORDING INFO", "", "#2c7bb6", True])
-        rows.append(["Task Samples", f"{len(ecg_raw):,}", "#f0f4f8", False])
-        rows.append(["Task Duration", f"{len(ecg_raw)/sampling_rate:.1f}s  /  {len(ecg_raw)/sampling_rate/60:.2f} min", "#f0f4f8", False])
-
-        rows.append(["QUALITY REPORT", "", "#2c7bb6", True])
-        rows.append(["Absolute Minimum Quality", f"{np.min(quality):.4f}", "#ffffff", False])
-        rows.append(["Absolute Maximum Quality", f"{np.max(quality):.4f}", "#ffffff", False])
-        rows.append(["Mean Quality", f"{np.mean(quality):.4f}", "#ffffff", False])
-        rows.append(["Median Quality", f"{np.median(quality):.4f}", "#ffffff", False])
-        rows.append(["Standard Deviation", f"{np.std(quality):.4f}", "#ffffff", False])
-        rows.append(["5 Lowest Indices", str(worst_indices), "#ffffff", False])
-        rows.append(["5 Lowest Values", str(np.round(worst_values, 4)), "#ffffff", False])
-
-        rows.append(["FILE RELIABILITY", "", "#2c7bb6", True])
-        rows.append([f"% of file > {config.quality_threshold} quality", f"{high_quality_pct:.2f}%", "#d9ead3", False])
-        ### ADD NEW EPOCH ####
-        rows.append(["Usable Epoch (%)", f"{usable_epoch_pct:.2f}%", "#d9ead3", False])
-        ##########################
-        rows.append(["Status", status, "#d9ead3", True])
-
-
-
-        rows.append(["AUTOMATED SEGMENT DETECTION", "", "#2c7bb6", True])
-        rows.append(["Total Segments Detected", str(len(onsets)), "#f0f4f8", False])
-        for i, (seg_start, seg_end) in enumerate(zip(onsets, offsets)):
-            start_sec_seg = seg_start / sampling_rate
-            end_sec_seg = seg_end / sampling_rate
-            duration_seg = (seg_end - seg_start) / sampling_rate
-            bg = "#ffffff" if i % 2 == 0 else "#f7f7f7"
-            rows.append([
-                f"Segment {i+1}",
-                f"Onset: {seg_start} ({int(start_sec_seg//60)}m {int(start_sec_seg%60)}s)  |  "
-                f"Offset: {seg_end} ({int(end_sec_seg//60)}m {int(end_sec_seg%60)}s)  |  "
-                f"Duration: {duration_seg:.2f}s",
-                bg, False
-            ])
-        rows.append(["TOTAL USABLE YIELD", f"{total_usable_seconds:.2f}s  /  {total_usable_seconds/60:.2f} min", "#d9ead3", True])
-
-        cell_text = [[r[0], r[1]] for r in rows]
-        cell_colors = [[r[2], r[2]] for r in rows]
-        table = ax.table(
-            cellText=cell_text,
-            colLabels=["Metric / Section", "Value"],
-            cellColours=cell_colors,
-            loc='center',
-            cellLoc='left',
-            bbox=[0, 0, 1, 1]
+        print(
+            f"Usable Epoch after 20% bad-segment removal: "
+            f"{usable_epoch_pct:.2f}%"
         )
-        table.auto_set_font_size(False)
-        table.set_fontsize(11)
-        table.auto_set_column_width(col=[0, 1])
-        for (row, col), cell in table.get_celld().items():
-            cell.set_height(1.0 / (len(rows) + 1))
-            cell.PAD = 0.04
-        for j in range(2):
-            table[0, j].set_facecolor('#1a4a7a')
-            table[0, j].set_text_props(color='white', fontweight='bold')
-        for i, r in enumerate(rows):
-            if r[3]:
-                for j in range(2):
-                    cell = table[i + 1, j]
-                    cell.set_text_props(fontweight='bold', color='white' if r[2] == '#2c7bb6' else 'black')
 
-        ax.set_title(simple_title(subject, session, task, "Full Signal & Quality Report"), fontweight='bold', fontsize=13, pad=12)
-        fig.savefig(os.path.join(output_folder, f'{title_base}_Quality_Report.png'), bbox_inches='tight', dpi=150)
-        plt.close(fig)
+
+        # 20b. Full Signal & Quality Report
+        # ------------------------------------------------------------
+        # IMPORTANT:
+        # Template-match quality is used here ONLY as a descriptive QC report.
+        # It does NOT remove ECG samples, R-peaks, RR intervals, or affect HR/HRV.
+        #
+        # The 0.95 value below is therefore a REPORTING cutoff only.
+        # Actual cleaning remains:
+        #   1) 20% RR-change rule
+        #   2) signal_fixpeaks interval_min=0.30, interval_max=0.75
+
+        REPORT_QUALITY_THRESHOLD = 0.95
+
+        try:
+            quality = np.asarray(
+                nk.ecg_quality(
+                    ecg_filtered,
+                    sampling_rate=sampling_rate,
+                    method="templatematch"
+                )
+            ).flatten()
+
+            min_val = float(np.nanmin(quality))
+            max_val = float(np.nanmax(quality))
+            mean_val = float(np.nanmean(quality))
+            median_val = float(np.nanmedian(quality))
+            std_val = float(np.nanstd(quality))
+
+            n_worst = min(5, len(quality))
+            if n_worst > 0:
+                worst_indices = np.argpartition(
+                    quality,
+                    n_worst - 1
+                )[:n_worst]
+
+                # Sort the five selected samples from lowest quality upward.
+                worst_indices = worst_indices[
+                    np.argsort(quality[worst_indices])
+                ]
+                worst_values = quality[worst_indices]
+            else:
+                worst_indices = np.array([], dtype=int)
+                worst_values = np.array([], dtype=float)
+
+            high_quality_pct = (
+                np.sum(quality >= REPORT_QUALITY_THRESHOLD)
+                / len(quality)
+                * 100
+                if len(quality) > 0
+                else np.nan
+            )
+
+            # Usable epoch remains based ONLY on 20%-rule bad segments.
+            total_duration = len(ecg_raw) / sampling_rate
+            total_red_gaps_sec = sum(
+                seg["end_sec"] - seg["start_sec"]
+                for seg in bad_segments
+            )
+
+            if total_duration > 0:
+                usable_epoch_pct = (
+                    (total_duration - total_red_gaps_sec)
+                    / total_duration
+                ) * 100
+            else:
+                usable_epoch_pct = 0.0
+
+            rows = []
+
+            rows.append([
+                "RECORDING INFO",
+                "",
+                "#2c7bb6",
+                True
+            ])
+            rows.append([
+                "Task Samples",
+                f"{len(ecg_raw):,}",
+                "#f0f4f8",
+                False
+            ])
+            rows.append([
+                "Task Duration",
+                (
+                    f"{len(ecg_raw)/sampling_rate:.1f}s  /  "
+                    f"{len(ecg_raw)/sampling_rate/60:.2f} min"
+                ),
+                "#f0f4f8",
+                False
+            ])
+
+            rows.append([
+                "QUALITY REPORT",
+                "",
+                "#2c7bb6",
+                True
+            ])
+            rows.append([
+                "Absolute Minimum Quality",
+                f"{min_val:.4f}",
+                "#ffffff",
+                False
+            ])
+            rows.append([
+                "Absolute Maximum Quality",
+                f"{max_val:.4f}",
+                "#ffffff",
+                False
+            ])
+            rows.append([
+                "Mean Quality",
+                f"{mean_val:.4f}",
+                "#ffffff",
+                False
+            ])
+            rows.append([
+                "Median Quality",
+                f"{median_val:.4f}",
+                "#ffffff",
+                False
+            ])
+            rows.append([
+                "Standard Deviation",
+                f"{std_val:.4f}",
+                "#ffffff",
+                False
+            ])
+            rows.append([
+                "5 Lowest Indices",
+                str(worst_indices),
+                "#ffffff",
+                False
+            ])
+            rows.append([
+                "5 Lowest Values",
+                str(np.round(worst_values, 4)),
+                "#ffffff",
+                False
+            ])
+
+            rows.append([
+                "FILE RELIABILITY",
+                "",
+                "#2c7bb6",
+                True
+            ])
+            
+            rows.append([
+                "Usable Epoch (%)",
+                f"{usable_epoch_pct:.2f}%",
+                "#d9ead3",
+                False
+            ])
+
+            n_data_rows = len(rows)
+            fig_height = 1.0 + n_data_rows * 0.4
+
+            fig, ax = plt.subplots(
+                figsize=(TABLE_WIDTH, fig_height)
+            )
+            ax.axis("off")
+
+            cell_text = [
+                [row[0], row[1]]
+                for row in rows
+            ]
+            cell_colors = [
+                [row[2], row[2]]
+                for row in rows
+            ]
+
+            table = ax.table(
+                cellText=cell_text,
+                colLabels=["Metric / Section", "Value"],
+                cellColours=cell_colors,
+                loc="center",
+                cellLoc="left",
+                bbox=[0, 0, 1, 1]
+            )
+
+            table.auto_set_font_size(False)
+            table.set_fontsize(11)
+            table.auto_set_column_width(col=[0, 1])
+
+            for (row_i, col_i), cell in table.get_celld().items():
+                cell.set_height(1.0 / (len(rows) + 1))
+                cell.PAD = 0.04
+
+            for col_i in range(2):
+                table[0, col_i].set_facecolor("#1a4a7a")
+                table[0, col_i].set_text_props(
+                    color="white",
+                    fontweight="bold"
+                )
+
+            for row_i, row_data in enumerate(rows):
+                if row_data[3]:
+                    for col_i in range(2):
+                        cell = table[row_i + 1, col_i]
+                        cell.set_text_props(
+                            fontweight="bold",
+                            color=(
+                                "white"
+                                if row_data[2] == "#2c7bb6"
+                                else "black"
+                            )
+                        )
+
+            ax.set_title(
+                simple_title(
+                    subject,
+                    session,
+                    task,
+                    "Full Signal & Quality Report"
+                ),
+                fontweight="bold",
+                fontsize=13,
+                pad=12
+            )
+
+            finalize_and_save(
+                fig,
+                os.path.join(
+                    png_folder,
+                    f"{title_base}_Quality_Report.png"
+                )
+            )
+
+        except Exception as e:
+            save_placeholder_plot(
+                os.path.join(
+                    png_folder,
+                    f"{title_base}_Quality_Report.png"
+                ),
+                simple_title(
+                    subject,
+                    session,
+                    task,
+                    "Full Signal & Quality Report"
+                ),
+                f"Could not create quality report: {e}"
+            )
+
 
         # 21. RS summary CSV (metric/value format for Excel)
         summary_rows = [
-            ('subject_id', subject.replace('sub-', '')),
             ('session_id', session.replace('ses-', '')),
             ('task_name', task),
             ('selected_ecg_channel', ecg_channel),
-            ('ecg_channel_selection_decision', ecg_channel_source),
-            (
-                'available_ecg_candidate_channels',
-                ';'.join(
-                    ecg_selection_details.get(
-                        'available_channels',
-                        []
-                    )
-                )
-            ),
-            (
-                'candidate_channel_rpeak_counts',
-                str(
-                    ecg_selection_details.get(
-                        'rpeak_counts',
-                        {}
-                    )
-                )
-            ),
+            # ('ecg_channel_selection_decision', ecg_channel_source),
+            # (
+            #     'available_ecg_candidate_channels',
+            #     ';'.join(
+            #         ecg_selection_details.get(
+            #             'available_channels',
+            #             []
+            #         )
+            #     )
+            # ),
+            # (
+            #     'candidate_channel_rpeak_counts',
+            #     str(
+            #         ecg_selection_details.get(
+            #             'rpeak_counts',
+            #             {}
+            #         )
+            #     )
+            # ),
             ('sampling_rate_hz', sampling_rate),
             ('full_recording_duration_seconds', round(full_duration_sec, 6)),
             ('analysis_start_sec', round(float(task_start_sec), 6)),
             ('analysis_end_sec', round(float(task_end_sec), 6)),
             ('duration_seconds', round(len(ecg_raw) / sampling_rate, 6)),
             ('duration_minutes', round(len(ecg_raw) / sampling_rate / 60, 6)),
-            ('quality_mean', round(float(np.mean(quality)), 6)),
-            ('quality_min', round(float(np.min(quality)), 6)),
-            ('quality_max', round(float(np.max(quality)), 6)),
-            ('quality_std', round(float(np.std(quality)), 6)),
-            ('quality_median', round(float(np.median(quality)), 6)),
-            ('high_quality_pct', round(float(high_quality_pct), 6)),
-            ###### ADD NEW EPOCH METRIC ######
             ('usable_epoch_pct', round(float(usable_epoch_pct), 6)),
-            ##################################
             ('num_peaks_detected', int(len(original_peaks))),
-            ('processing_order', '20percent_rule_then_fixpeaks_interval_limits'),
-            ('rr_change_threshold_percent', round(RR_PERCENT_CHANGE_THRESHOLD * 100, 2)),
+            # ('rr_change_threshold_percent', round(RR_PERCENT_CHANGE_THRESHOLD * 100, 2)),
             ('num_peaks_after_20percent_bad_segment_removal', int(len(peaks_after_20pct_removal))),
-            ('fixpeaks_interval_min_sec', FIXPEAKS_INTERVAL_MIN),
-            ('fixpeaks_interval_max_sec', FIXPEAKS_INTERVAL_MAX),
             ('num_peaks_inserted_by_fixpeaks', int(len(inserted_by_fixpeaks))),
             ('num_peaks_removed_by_fixpeaks', int(len(removed_by_fixpeaks))),
             ('num_peaks_final_after_fixpeaks', int(len(peaks_final))),
-            ('rr_change_formula', 'abs(RR_n - RR_n_minus_1) / RR_n'),
+            # ('rr_change_formula', 'abs(RR_n - RR_n_minus_1) / RR_n'),
             ('num_bad_segments_20percent', int(len(bad_segments))),
             ('rr_20percent_intervals_removed', int(beats_removed)),
             ('rr_20percent_filter_yield_pct', round(float(filter_yield_pct), 6)),
-            ('num_segments', int(len(onsets))),
-            ('total_usable_seconds', round(float(total_usable_seconds), 6)),
-            ('mean_rr_interval_sec', round(float(np.mean(rr_cleaned)) if len(rr_cleaned) > 0 else np.nan, 6)),
-            ('min_rr_interval_sec', round(float(np.min(rr_cleaned)) if len(rr_cleaned) > 0 else np.nan, 6)),
-            ('max_rr_interval_sec', round(float(np.max(rr_cleaned)) if len(rr_cleaned) > 0 else np.nan, 6)),
+            # ('num_segments', int(len(onsets))),
+            # ('total_usable_seconds', round(float(total_usable_seconds), 6)),
+            ('mean_rr_interval_sec', round(float(np.mean(rr_final_cleaned)) if len(rr_final_cleaned) > 0 else np.nan, 6)),
+            ('min_rr_interval_sec', round(float(np.min(rr_final_cleaned)) if len(rr_final_cleaned) > 0 else np.nan, 6)),
+            ('max_rr_interval_sec', round(float(np.max(rr_final_cleaned)) if len(rr_final_cleaned) > 0 else np.nan, 6)),
+            ('sdnn_rr_interval_sec', round(float(sdnn) / 1000.0, 6) if np.isfinite(sdnn) else np.nan),
+            ('rmssd_rr_interval_sec', round(float(rmssd) / 1000.0, 6) if np.isfinite(rmssd) else np.nan), 
             ('mean_heart_rate_bpm', round(float(mean_hr), 6) if not np.isnan(mean_hr) else np.nan),
             ('min_heart_rate_bpm', round(float(min_hr), 6) if not np.isnan(min_hr) else np.nan),
             ('max_heart_rate_bpm', round(float(max_hr), 6) if not np.isnan(max_hr) else np.nan),
             ('std_heart_rate_bpm', round(float(std_hr), 6) if not np.isnan(std_hr) else np.nan),
-            ('start_marker_label', marker_start_label if marker_start_label is not None else ''),
-            ('start_marker_sec', round(float(marker_start_sec), 6) if marker_start_sec is not None else np.nan),
-            ('end_marker_label', marker_end_label if marker_end_label is not None else ''),
-            ('end_marker_sec', round(float(marker_end_sec), 6) if marker_end_sec is not None else np.nan),
+
+            # ('start_marker_label', marker_start_label if marker_start_label is not None else ''),
+            # ('start_marker_sec', round(float(marker_start_sec), 6) if marker_start_sec is not None else np.nan),
+            # ('end_marker_label', marker_end_label if marker_end_label is not None else ''),
+            # ('end_marker_sec', round(float(marker_end_sec), 6) if marker_end_sec is not None else np.nan),
         ]
-        save_rs_summary_csv(output_folder, title_base, summary_rows)
+        save_rs_summary_csv(csv_folder, title_base, summary_rows)
 
         print(f"\n Finished: {filename}")
         print(f"Outputs saved in: {output_folder}")
@@ -3170,6 +3110,8 @@ def process_file(
         print(f"Error Message: {str(e)}")
         print(f"{'-'*40}")
 
+        subject = f"sub-{config.participant_labels[0]}" if config.participant_labels else "unknown_subject"
+        session = f"ses-{config.session_labels[0]}" if config.session_labels else "unknown_session"
         log_path = Path(config.output_dir) / subject / session / "failed_files_log.txt"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -3214,6 +3156,10 @@ def main() -> int:
     print("--------------------------")
     print("Input folder:", config.input_dir)
     print("Output folder:", config.output_dir)
+    if config.participant_labels:
+            print("Filtering for participant labels:", config.participant_labels)
+    if config.session_labels:
+        print("Filtering for session labels:", config.session_labels)
     print("Tasks:", list(config.tasks))
     print("Acquisition:", config.acq)
     print("Automatic ECG candidates:", ECG_CANDIDATE_CHANNELS)
@@ -3230,6 +3176,7 @@ def main() -> int:
     print("QC marker window seconds:", config.qc_window_sec)
     print("--------------------------\n")
 
+
     file_paths = find_task_set_files(
         config.input_dir,
         list(config.tasks),
@@ -3240,7 +3187,7 @@ def main() -> int:
 
     if not file_paths:
         print(f"Status: No .set files found in {config.input_dir}")
-        return 0
+        return 1
 
     total_files = len(file_paths)
     failed_files = 0

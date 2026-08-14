@@ -5,3 +5,4 @@ scipy>=1.10
 neurokit2>=0.2.10
 mne>=1.6
 pymatreader>=0.0.32
+eeglabio
