@@ -47,6 +47,7 @@ The pipeline requires the following Python packages:
 - mne
 - neurokit2
 - scipy
+- eeglabio
 
 Install them in your Python environment before running the script.
 
@@ -55,15 +56,15 @@ Install them in your Python environment before running the script.
 Run the pipeline from the repository directory:
 
 ```bash
-python HBCD_ECG_pipeline_v6.py <bids_dir> <output_dir> <analysis_level> [options]
+python HBCD_ECG_pipeline_v6.py <bids_dir> <output_dir> [analysis_level] [options]
 ```
 
 ### Example
 
 ```bash
 python HBCD_ECG_pipeline_v6.py /path/to/bids /path/to/output participant_level \
-  --participant_label 1234 \
-  --session_label V01 \
+  --participant-label 1234 \
+  --session-label V01 \
   --tasks RS \
   --acq ecg
 ```
@@ -74,20 +75,25 @@ python HBCD_ECG_pipeline_v6.py /path/to/bids /path/to/output participant_level \
 
 - bids_dir: path to the BIDS dataset directory
 - output_dir: path where results will be written
-- analysis_level: must be participant_level or group_level
+- analysis_level: optional positional; default is `participant_level` (only `participant_level` is supported)
 
 ### Optional filters
 
-- --participant_label: one or more participant labels without the sub- prefix
-- --session_label: one or more session labels without the ses- prefix
+- `--participant-label`: one or more participant labels (without the `sub-` prefix)
+- `--session-label`: one or more session labels (without the `ses-` prefix)
 
 ### Pipeline-specific options
 
-- --tasks: one or more task names to process; default is RS
-- --acq: acquisition label to match; default is ecg
-- --fallback-ecg-channel: fallback ECG channel name if channels.tsv does not explicitly label ECG/EKG; default is E128
-- --quality-threshold: threshold used for high-quality segment detection; default is 0.95
-- --qc-window-sec: seconds before/after event markers shown in QC plots; default is 10
+- `--tasks`: one or more task names to process; default is `RS`
+- `--acq`: acquisition label to match; default is `ecg`
+- `--fallback-ecg-channel`: fallback ECG channel name if `channels.tsv` does not explicitly label ECG/EKG; default is `E128` (this option is present but suppressed from the help text)
+- `--quality-threshold`: ECG quality cutoff for high-quality segment detection; default is `0.95`
+- `--qc-window-sec`: seconds before/after event markers for QC plots; default is `10.0`
+
+Notes:
+- The script currently accepts only `participant_level` analysis (the positional `analysis_level` exists for BIDS-App compatibility).
+- Task labels are normalized to uppercase by the script (e.g., `RS`).
+- Participant and session label arguments must not contain path separators.
 
 ## Behavior notes
 
@@ -102,26 +108,39 @@ For each processed file, results are written under:
 
 ```text
 <output_dir>/<subject>/<session>/ecg/<task>-task/
+  png/
+  csv/
+  data/
 ```
 
 Typical output files include:
 
-- PNG plots for raw ECG, filtered ECG, quality, R-peaks, RR intervals, heart rate, HRV, segmentation, and task isolation
-- CSV files containing RR interval filtering details and bad-segment information
-- a summary CSV named like <subject>_<session>_task-<task>_summary.csv
-- a failed_files_log.txt in the base output directory if any file fails during processing
+- PNG plots written to the `png` subfolder (examples saved by the pipeline):
+  - `<title_base>_raw_ecg.png`
+  - `<title_base>_filtered_ecg.png`
+  - `<title_base>_delineation.png`
+  - `<title_base>_heart_rate.png`
+  - `<title_base>_rr_vs_hr.png`
+  - `<title_base>_segmented_heartbeat.png`
+  - `<title_base>_HRV_TimeDomain.png`
+  - `<title_base>_HRV_new_metrics.png`
+  - `<title_base>_filtered_task_window_isolated.png`
+  - `<title_base>_filtered_task_window_isolated_zoom.png`
 
-## Example outputs
+- CSV files written to the `csv` subfolder, including summary CSVs and RR-filter details. The script writes a participant/task summary as:
+  - `<title_base>_summary.csv`
 
-Examples of generated files include:
+- Raw/derived `.set` and other data artifacts are written to the `data` subfolder, for example:
+  - `<title_base>_raw_bas_trsp.set`
+  - `<title_base>_filtered_ecg.set`
 
-- <subject>_<session>_task-RS_raw_ecg.png
-- <subject>_<session>_task-RS_filtered_ecg.png
-- <subject>_<session>_task-RS_quality.png
-- <subject>_<session>_task-RS_rpeak_validation.png
-- <subject>_<session>_task-RS_heart_rate.png
-- <subject>_<session>_task-RS_HRV_TimeDomain.png
-- <subject>_<session>_task-RS_summary.csv
+- Participant/session-level logs (written alongside the participant folder):
+  - `skipped_no_ecg_channel_log.txt` — created when no ECG channel is selected for a participant/session
+  - `failed_files_log.txt` — written under `<output_dir>/<subject>/<session>/failed_files_log.txt` when a file fails processing
+
+Notes:
+- `title_base` is typically the filename base such as `sub-1234_ses-V01_task-RS` and the pipeline constructs file names using this prefix.
+- The pipeline creates `png`, `csv`, and `data` subfolders only after an ECG channel is successfully selected; skipped participants will contain the skipped log but no `png/csv/data` subfolders.
 
 ## Troubleshooting
 
