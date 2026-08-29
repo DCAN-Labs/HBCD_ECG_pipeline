@@ -183,6 +183,7 @@ DEFAULT_SAMPLING_RATE = 1000
 FIXPEAKS_INTERVAL_MIN = 0.30
 FIXPEAKS_INTERVAL_MAX = 0.75
 RR_PERCENT_CHANGE_THRESHOLD = 0.20
+EXCESSIVE_REMOVAL_THRESHOLD_PCT = 80.0
 
 # Add a small amount of time around each RR interval flagged by the 20% rule.
 BAD_SEGMENT_PADDING_SEC = 1.0 # removes exactly the flagged interval with no buffer on either side.
@@ -234,9 +235,8 @@ def find_task_set_files(
 
                 task_files = list(input_dir.glob(pattern))
 
-                print(f"Search pattern: {input_dir / pattern}")
-                print(f"Found {len(task_files)} files.\n")
-
+                print(f"Search pattern for task-{task}: {input_dir / pattern}")
+                print(f"Found {len(task_files)} task-{task} acq-{acq_to_process} .set files.\n")
                 all_set_files.extend(task_files)
 
     return sorted(all_set_files)
@@ -539,7 +539,7 @@ def select_most_likely_ecg_channel(raw):
 
 
 def append_no_ecg_skip_log(
-    output_dir,
+    output_folder,
     file_path,
     subject,
     session,
@@ -548,11 +548,13 @@ def append_no_ecg_skip_log(
     details
 ):
     """
-        Write the no-ECG log at the participant level.
-    
+    Write the no-ECG log at the participant level.
+
     """
-    log_path = Path(output_dir) / subject / session / "skipped_no_ecg_channel_log.txt"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    output_folder = Path(output_folder)
+    output_folder.mkdir(parents=True, exist_ok=True)
+
+    log_path = output_folder / "skipped_no_ecg_channel_log.txt"
     timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     with open(log_path, "a", encoding="utf-8") as log:
@@ -610,13 +612,13 @@ def make_output_folder(output_dir, set_file, task):
     output_folder.mkdir(parents=True, exist_ok=True)
 
     return (
-            output_folder,
-            png_folder,
-            csv_folder,
-            set_folder,
-            subject,
-            session
-        )
+        output_folder,
+        png_folder,
+        csv_folder,
+        set_folder,
+        subject,
+        session
+    )
 
 
 def create_ecg_output_subfolders(png_folder, csv_folder, set_folder):
@@ -666,10 +668,6 @@ def choose_plot_window(signal, start=4000, end=6000, fallback=2000):
     return start, min(len(signal), end)
 
 
-# def safe_minmax(arr):
-#     arr = np.asarray(arr)
-#     return float(np.nanmin(arr)), float(np.nanmax(arr))
-
 
 def read_events_file(events_tsv):
     if events_tsv is None or not Path(events_tsv).exists():
@@ -694,7 +692,6 @@ def get_task_start_end_markers(events_df):
     if 'trial_type' not in df.columns:
         df['trial_type'] = ''
 
-    # START priority: bas+ > DIN3 > last bgin > first non-boundary event
     start_sec = None
     start_label = None
     for marker in ['bas+', 'DIN3']:
@@ -737,7 +734,6 @@ def make_task_relative_events(events_df, task_start_sec, task_end_sec):
     - After trimming, bas+ onset becomes 0 seconds
     - TRSP becomes task_duration seconds
 
-    This keeps plots from showing anything before bas+.
     """
     if events_df is None or len(events_df) == 0 or 'onset' not in events_df.columns:
         return None
@@ -805,7 +801,7 @@ def plot_custom_time_window(signal, sampling_rate, start_sec, end_sec, subject, 
     fig, ax = plt.subplots(figsize=WIDE_TALL_FIG, constrained_layout=True)
     ax.plot(times, signal[start_idx:end_idx], color='blue', lw=1.0)
     ax.set_title(simple_title(subject, session, task, f"{signal_name} Custom Window {start_sec:.0f}-{end_sec:.0f} sec"))
-    ax.set_xlabel('Time (seconds)')
+    ax.set_xlabel('Time Center on Rpeaks (seconds)')
     ax.set_ylabel('Amplitude [mV]')
     ax.grid(True, alpha=0.3)
     finalize_and_save(fig, output_path)
@@ -935,7 +931,7 @@ def plot_marker_qc(
             f"{signal_name} QC Around {marker_label} (±{window_sec} sec)"
         )
     )
-    ax.set_xlabel('Time (seconds)')
+    ax.set_xlabel('Time Center on Rpeaks (seconds)')
     ax.set_ylabel('Amplitude [mV]')
     ax.legend(loc='upper right')
     ax.grid(True, alpha=0.3)
@@ -944,49 +940,7 @@ def plot_marker_qc(
 
 def save_rs_summary_csv(output_folder, title_base, summary_rows):
     summary_df = pd.DataFrame(summary_rows, columns=['metric', 'value'])
-    summary_df.to_csv(Path(output_folder) / f"{title_base}_summary.csv", index=False)
-
-
-# Compare R-peaks before and after signal_fixpeaks correction.
-
-def plot_peak_correction_comparison(ecg_filtered, original_peaks, cleaned_peaks, sampling_rate, title_base, output_folder, task_label):
-    if len(original_peaks) < 2 or len(cleaned_peaks) < 2:
-        save_placeholder_plot(
-            os.path.join(output_folder, f"{title_base}_peak_correction_comparison.png"),
-            simple_title(*task_label, "Peak Correction Comparison (Original vs Cleaned)"),
-            "Not enough peaks to create original vs cleaned comparison plot."
-        )
-        return
-
-   
-    all_ref = cleaned_peaks if len(cleaned_peaks) > 0 else original_peaks
-    first_idx = max(0, all_ref[0] - 200)
-    ref_end_peak = all_ref[min(len(all_ref) - 1, 4)]
-    last_idx = min(len(ecg_filtered), ref_end_peak + 300)
-    x = np.arange(first_idx, last_idx)
-
-    fig, axes = plt.subplots(2, 1, figsize=DOUBLE_FIG, sharex=True, constrained_layout=True)
-    axes[0].plot(x, ecg_filtered[first_idx:last_idx], color='blue', lw=1.0, label='Filtered ECG')
-    use_orig = original_peaks[(original_peaks >= first_idx) & (original_peaks <= last_idx)]
-    if len(use_orig) > 0:
-        axes[0].scatter(use_orig, ecg_filtered[use_orig], color='red', s=32, label='Original R-peaks', zorder=3)
-    axes[0].set_title(simple_title(*task_label, "Original R-Peaks (Before Correction)"), fontsize=12, fontweight='bold')
-    axes[0].set_ylabel("Voltage [mV]")
-    axes[0].legend(loc='upper right')
-    axes[0].grid(True, alpha=0.3)
-
-    axes[1].plot(x, ecg_filtered[first_idx:last_idx], color='blue', lw=1.0, label='Filtered ECG')
-    use_clean = cleaned_peaks[(cleaned_peaks >= first_idx) & (cleaned_peaks <= last_idx)]
-    if len(use_clean) > 0:
-        axes[1].scatter(use_clean, ecg_filtered[use_clean], color='green', s=32, label='Cleaned R-peaks', zorder=3)
-    axes[1].set_title(simple_title(*task_label, "Cleaned R-Peaks (After Correction)"), fontsize=12, fontweight='bold')
-    axes[1].set_xlabel("Samples [N]")
-    axes[1].set_ylabel("Voltage [mV]")
-    axes[1].legend(loc='upper right')
-    axes[1].grid(True, alpha=0.3)
-
-    fig.suptitle(simple_title(*task_label, "Peak Correction Comparison (Original vs Cleaned)"), fontsize=13, fontweight='bold')
-    finalize_and_save(fig, os.path.join(output_folder, f"{title_base}_peak_correction_comparison.png"))
+    summary_df.to_csv(Path(output_folder) / f"{title_base}_summary.csv", index=False, na_rep="NA")
 
 
 
@@ -1064,7 +1018,6 @@ def apply_20percent_rr_change_filter(peaks, sampling_rate, threshold=0.20):
 def merge_bad_segments(segments):
     """
     Merge bad segments that overlap or touch each other.
-    This avoids having many tiny overlapping red shaded regions.
     """
 
     if len(segments) == 0:
@@ -1147,7 +1100,7 @@ def apply_fixpeaks_within_good_segments(
     and corrected peak arrays.
     """
     peaks = np.asarray(peaks, dtype=int)
-    
+
     if len(peaks) == 0:
         return np.array([], dtype=int), {
             "inserted_peaks": np.array([], dtype=int),
@@ -1474,7 +1427,7 @@ def process_file(
             )
 
             append_no_ecg_skip_log(
-                output_dir=config.output_dir,
+                output_folder=output_folder,
                 file_path=file_path,
                 subject=subject,
                 session=session,
@@ -1641,8 +1594,9 @@ def process_file(
             order=2,
             powerline=60
         )
+
         # Generate .set file for trimmed Bas+ to TRSP signal
-        
+
         # 1. Convert 1D ecg_filtered array into a 2D array (shape: 1 x n_samples)
         ecg_filtered_2d = ecg_filtered[np.newaxis, :]
 
@@ -1748,6 +1702,42 @@ def process_file(
             rr_final_cleaned,
             sampling_rate
         )
+
+        # Excessive-removal QC after 20% removal + interval correction
+        total_task_duration_sec = len(ecg_filtered) / sampling_rate
+        total_bad_duration_sec = sum(
+            max(0.0, float(seg["end_sec"]) - float(seg["start_sec"]))
+            for seg in bad_segments
+        )
+
+        data_removed_pct = (
+            100.0 * total_bad_duration_sec / total_task_duration_sec
+            if total_task_duration_sec > 0 else 100.0
+        )
+        rpeaks_removed_final_pct = (
+            100.0 * (1.0 - len(peaks_final) / len(original_peaks))
+            if len(original_peaks) > 0 else 100.0
+        )
+        rr_removed_final_pct = (
+            100.0 * (1.0 - len(rr_final_cleaned) / len(rr_raw))
+            if len(rr_raw) > 0 else 100.0
+        )
+
+        rpeaks_removed_final_pct = max(0.0, rpeaks_removed_final_pct)
+        rr_removed_final_pct = max(0.0, rr_removed_final_pct)
+
+        poor_quality_excessive_removal = (
+            rr_removed_final_pct > EXCESSIVE_REMOVAL_THRESHOLD_PCT
+            or rpeaks_removed_final_pct > EXCESSIVE_REMOVAL_THRESHOLD_PCT
+            or data_removed_pct > EXCESSIVE_REMOVAL_THRESHOLD_PCT
+        )
+
+        print("\n--- Excessive Removal QC ---")
+        print(f"RR removed: {rr_removed_final_pct:.2f}%")
+        print(f"R-peaks removed: {rpeaks_removed_final_pct:.2f}%")
+        print(f"Data removed/masked: {data_removed_pct:.2f}%")
+        print(f"Poor-quality flag: {poor_quality_excessive_removal}")
+
         # ------------------------------------------------------------
         # EXPORT ANALYSIS-READY ECG DERIVATIVES
         # ------------------------------------------------------------
@@ -1794,73 +1784,104 @@ def process_file(
                     start_sample:end_sample + 1
                 ] = np.nan
 
-        #3. Convert the 1D array into a 2D array for MNE compatibility
-        final_ecg_2d = ecg_final_processed[np.newaxis, :]
-
-        final_ecg_info = mne.create_info(
-            ch_names=["ECG"],
-            sfreq=sampling_rate,
-            ch_types=["ecg"]
-        )
-
-        raw_final_processed = mne.io.RawArray(
-            final_ecg_2d,
-            final_ecg_info,
-            verbose=False
-        )
-
+        #3. Export final processed ECG only if excessive-removal QC passes
         final_set_path = os.path.join(
             set_folder,
             f"{title_base}_final_processed_ecg.set"
         )
 
-        raw_final_processed.export(
-            final_set_path,
-            fmt="eeglab",
-            overwrite=True,
-            verbose=False
-        )
+        if not poor_quality_excessive_removal:
+            final_ecg_2d = ecg_final_processed[np.newaxis, :]
+
+            final_ecg_info = mne.create_info(
+                ch_names=["ECG"],
+                sfreq=sampling_rate,
+                ch_types=["ecg"]
+            )
+
+            raw_final_processed = mne.io.RawArray(
+                final_ecg_2d,
+                final_ecg_info,
+                verbose=False
+            )
+
+            raw_final_processed.export(
+                final_set_path,
+                fmt="eeglab",
+                overwrite=True,
+                verbose=False
+            )
+        else:
+            if os.path.exists(final_set_path):
+                os.remove(final_set_path)
+            final_set_path = None
+            print("Final processed ECG .set NOT exported: >80% removal QC flag.")
 
 
         # B. Exact final RR intervals used for HR/HRV and Rpeaks
-        all_final_start_peaks = (
-            peaks_final[:-1]
-            if len(peaks_final) > 1
-            else np.array([], dtype=int)
-        )
-        all_final_end_peaks = (
-            peaks_final[1:]
-            if len(peaks_final) > 1
-            else np.array([], dtype=int)
-        )
+        #
+        # Export only when the file passes the excessive-removal QC rule.
+        final_rr_path = None
 
-        final_rr_start_peaks = all_final_start_peaks[rr_gap_valid_mask]
-        final_rr_end_peaks = all_final_end_peaks[rr_gap_valid_mask]
-
-        final_rr_df = pd.DataFrame({
-            "rr_index": np.arange(len(rr_final_cleaned), dtype=int),
-            "rr_time_sec": rr_final_times,
-            "rr_interval_sec": rr_final_cleaned,
-            "heart_rate_bpm": (
-                60.0 / rr_final_cleaned
-                if len(rr_final_cleaned) > 0
-                else np.array([])
+        if not poor_quality_excessive_removal:
+            all_final_start_peaks = (
+                peaks_final[:-1]
+                if len(peaks_final) > 1
+                else np.array([], dtype=int)
             )
-        })
+            all_final_end_peaks = (
+                peaks_final[1:]
+                if len(peaks_final) > 1
+                else np.array([], dtype=int)
+            )
 
-        final_rr_path = os.path.join(
-            csv_folder,
-            f"{title_base}_final_rpeaks_rr.csv"
-        )
-        final_rr_df.to_csv(final_rr_path, index=False)
+            final_rr_start_peaks = all_final_start_peaks[rr_gap_valid_mask]
+            final_rr_end_peaks = all_final_end_peaks[rr_gap_valid_mask]
+
+            final_rr_df = pd.DataFrame({
+                "rr_index": np.arange(len(rr_final_cleaned), dtype=int),
+                "rr_time_sec": rr_final_times,
+                "rr_interval_sec": rr_final_cleaned,
+                "heart_rate_bpm": (
+                    60.0 / rr_final_cleaned
+                    if len(rr_final_cleaned) > 0
+                    else np.array([])
+                )
+            })
+
+            final_rr_path = os.path.join(
+                csv_folder,
+                f"{title_base}_final_rpeaks_rr.csv"
+            )
+            final_rr_df.to_csv(final_rr_path, index=False)
+
+        else:
+            stale_final_rr_path = os.path.join(
+                csv_folder,
+                f"{title_base}_final_rpeaks_rr.csv"
+            )
+            if os.path.exists(stale_final_rr_path):
+                os.remove(stale_final_rr_path)
+
+            print(
+                "Final R-peak/RR CSV NOT exported: "
+                ">80% removal QC flag."
+            )
+
 
         print("Analysis-ready processed data exported:")
         print(
             "  Reusable filtered ECG waveform: "
             + os.path.join(set_folder, f"{title_base}_filtered_ecg.set")
         )
-        print(f"  Final processed ECG waveform: {final_set_path}")
-        print(f"  Final RR used for HR/HRV: {final_rr_path}")
+        if final_set_path is not None:
+            print(f"  Final processed ECG waveform: {final_set_path}")
+        else:
+            print("  Final processed ECG waveform: NOT EXPORTED")
+        if final_rr_path is not None:
+            print(f"  Final RR used for HR/HRV: {final_rr_path}")
+        else:
+            print("  Final RR used for HR/HRV: NOT EXPORTED")
 
 
         print(f"Bad segments from 20% rule: {len(bad_segments)}")
@@ -2182,76 +2203,78 @@ def process_file(
 
 
 
-        # 14. ECG delineation
-        try:
-            nk.ecg_delineate(
-                ecg_filtered, rpeaks=peaks_final, sampling_rate=sampling_rate,
-                method='dwt', show=True, show_type='all', check=True,
-                window_start=-0.2, window_end=0.2
+        # Default to missing; calculate only for files that pass excessive-removal QC
+        ecg_rate = np.full(len(ecg_filtered), np.nan)
+        mean_hr = min_hr = max_hr = std_hr = np.nan
+        mean_nn = sdnn = rmssd = median_nn = np.nan
+
+        if not poor_quality_excessive_removal:
+            # 14. ECG delineation
+            try:
+                nk.ecg_delineate(
+                    ecg_filtered, rpeaks=peaks_final, sampling_rate=sampling_rate,
+                    method='dwt', show=True, show_type='all', check=True,
+                    window_start=-0.2, window_end=0.2
+                )
+                fig = plt.gcf()
+                fig.set_size_inches(18, 8)
+                ax = fig.axes[0]
+                ax.set_title(simple_title(subject, session, task, "ECG Delineation"))
+                ax.set_xlabel("Time Center on Rpeaks (seconds)")
+                ax.set_ylabel("Amplitude [mV]")
+                if ax.get_legend() is not None:
+                    ax.legend(loc='upper right', bbox_to_anchor=(1.02, 1))
+                finalize_and_save(fig, os.path.join(png_folder, f"{title_base}_delineation.png"))
+            except Exception as e:
+                save_placeholder_plot(
+                    os.path.join(png_folder, f"{title_base}_delineation.png"),
+                    simple_title(subject, session, task, "ECG Delineation"),
+                    f"Could not compute delineation: {e}"
+                )
+
+            # 15. ECG rate
+
+            ecg_rate = compute_safe_interpolated_hr_from_rr(
+                rr_times=rr_final_times,
+                rr_intervals=rr_final_cleaned,
+                sampling_rate=sampling_rate,
+                signal_length=len(ecg_filtered),
+                bad_segments=bad_segments,
+                max_gap_sec=MAX_RR_FOR_INTERPOLATION
             )
-            fig = plt.gcf()
-            fig.set_size_inches(18, 8)
-            ax = fig.axes[0]
-            ax.set_title(simple_title(subject, session, task, "ECG Delineation"))
-            ax.set_xlabel("Time Center on Rpeaks (seconds)")
-            ax.set_ylabel("Amplitude [mV]")
-            if ax.get_legend() is not None:
-                ax.legend(loc='upper right', bbox_to_anchor=(1.02, 1))
-            finalize_and_save(fig, os.path.join(png_folder, f"{title_base}_delineation.png"))
-        except Exception as e:
-            save_placeholder_plot(
-                os.path.join(png_folder, f"{title_base}_delineation.png"),
-                simple_title(subject, session, task, "ECG Delineation"),
-                f"Could not compute delineation: {e}"
-            )
 
-        # 15. ECG rate
+            mean_hr, min_hr, max_hr, std_hr = nan_summary(ecg_rate)
 
-        ecg_rate = compute_safe_interpolated_hr_from_rr(
-            rr_times=rr_final_times,
-            rr_intervals=rr_final_cleaned,
-            sampling_rate=sampling_rate,
-            signal_length=len(ecg_filtered),
-            bad_segments=bad_segments,
-            max_gap_sec=MAX_RR_FOR_INTERPOLATION
-        )
+            print("\n--- Heart Rate Summary ---")
+            print(f"Mean HR:  {mean_hr:.1f} bpm")
+            print(f"Min HR:   {min_hr:.1f} bpm")
+            print(f"Max HR:   {max_hr:.1f} bpm")
+            print(f"Std HR:   {std_hr:.1f} bpm")
 
-        mean_hr, min_hr, max_hr, std_hr = nan_summary(ecg_rate)
+            fig, ax = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
+            sample_time = np.arange(len(ecg_rate)) / sampling_rate
+            ax.plot(sample_time, ecg_rate, color='green', lw=0.8, label='Heart Rate from final cleaned RR (gaps over bad ECG segments)')
 
-        print("\n--- Heart Rate Summary ---")
-        print(f"Mean HR:  {mean_hr:.1f} bpm")
-        print(f"Min HR:   {min_hr:.1f} bpm")
-        print(f"Max HR:   {max_hr:.1f} bpm")
-        print(f"Std HR:   {std_hr:.1f} bpm")
+            if not np.isnan(mean_hr):
+                ax.axhline(mean_hr, color='red', linestyle='--', label=f'Mean HR: {mean_hr:.1f} bpm')
 
-        fig, ax = plt.subplots(figsize=WIDE_FIG, constrained_layout=True)
-        sample_time = np.arange(len(ecg_rate)) / sampling_rate
-        ax.plot(sample_time, ecg_rate, color='green', lw=0.8, label='Heart Rate from final cleaned RR (gaps over bad ECG segments)')
+            already_labeled = False
+            for seg in bad_segments:
+                ax.axvspan(
+                    seg["start_sec"],
+                    seg["end_sec"],
+                    color="red",
+                    alpha=0.12,
+                    label="Removed bad segment" if not already_labeled else None
+                )
+                already_labeled = True
 
-        if not np.isnan(mean_hr):
-            ax.axhline(mean_hr, color='red', linestyle='--', label=f'Mean HR: {mean_hr:.1f} bpm')
-
-        already_labeled = False
-        for seg in bad_segments:
-            ax.axvspan(
-                seg["start_sec"],
-                seg["end_sec"],
-                color="red",
-                alpha=0.12,
-                label="Removed bad segment" if not already_labeled else None
-            )
-            already_labeled = True
-
-        ax.set_title(simple_title(subject, session, task, "ECG Heart Rate Over Time"))
-        ax.set_xlabel("Task Time After bas+ (seconds)")
-        ax.set_ylabel("Heart Rate (bpm)")
-        ax.legend(loc='upper right')
-        ax.grid(True, alpha=0.3)
-        finalize_and_save(fig, os.path.join(png_folder, f"{title_base}_heart_rate.png"))
-
-
-
-
+            ax.set_title(simple_title(subject, session, task, "ECG Heart Rate Over Time"))
+            ax.set_xlabel("Task Time After bas+ (seconds)")
+            ax.set_ylabel("Heart Rate (bpm)")
+            ax.legend(loc='upper right')
+            ax.grid(True, alpha=0.3)
+            finalize_and_save(fig, os.path.join(png_folder, f"{title_base}_heart_rate.png"))
 
         # -------------------------------------------------------------------------
         # INTERPOLATED RR 
@@ -2276,7 +2299,7 @@ def process_file(
                 x_new=sample_times,
                 method='cubic'
             )
-            
+        
             # Re-mask the bad segments so the line breaks visually over noise blocks
             for seg in bad_segments:
                 mask_gap = (sample_times >= seg["start_sec"]) & (sample_times <= seg["end_sec"])
@@ -2409,13 +2432,13 @@ def process_file(
         try:
             hrv_time_df = nk.hrv_time(peaks_for_hrv, sampling_rate=sampling_rate, show=True)
             fig_hrv_time = plt.gcf()
-            
+        
             if figure_has_content(fig_hrv_time):
                 mean_nn = hrv_time_df['HRV_MeanNN'].values[0]
                 sdnn = hrv_time_df['HRV_SDNN'].values[0]
                 rmssd = hrv_time_df['HRV_RMSSD'].values[0]
                 median_nn = hrv_time_df['HRV_MedianNN'].values[0]
-                
+            
                 print(f"Subject {subject} - HRV Time Domain -> MeanNN: {mean_nn:.2f}, SDNN: {sdnn:.2f}, RMSSD: {rmssd:.2f}, MedianNN: {median_nn:.2f}")
 
                 ax = fig_hrv_time.axes[0]
@@ -2424,7 +2447,7 @@ def process_file(
                             f"SDNN     : {sdnn:>8.2f} ms\n"
                             f"RMSSD    : {rmssd:>8.2f} ms\n"
                             f"MedianNN : {median_nn:>8.2f} ms")
-                
+            
                 ax.text(
                     0.97,
                     0.97,
@@ -2557,7 +2580,7 @@ def process_file(
                 simple_title(subject, session, task, "HRV New Metrics"),
                 f"Could not compute modified HRV plot: {e}"
             )
-        
+    
 
 
 
@@ -2672,18 +2695,6 @@ def process_file(
                     zorder=5
                 )
 
-            if 'din3_marker_sec' in locals() and din3_marker_sec is not None:
-                ax_zoom.axvline(
-                    din3_marker_sec,
-                    color='gold',
-                    linestyle='-',
-                    linewidth=1.5,
-                    alpha=0.95,
-                    label=f'DIN3 ({din3_marker_sec:.2f}s)',
-                    zorder=6
-                )
-
-
             # Focus the X-axis strictly from 3 seconds before the start marker and 5 seconds past the start marker
             zoom_start_x = marker_start_sec - 3 if marker_start_sec is not None else 0.0
             zoom_end_x = (marker_start_sec + 5) if marker_start_sec is not None else 30.0
@@ -2728,27 +2739,13 @@ def process_file(
                         fontsize=10
                     )
 
-                if 'din3_marker_sec' in locals() and din3_marker_sec is not None:
-                    ax_zoom.text(
-                        din3_marker_sec + 0.03,
-                        label_y,
-                        'DIN3',
-                        color='goldenrod',
-                        rotation=90,
-                        ha='left',
-                        va='top',
-                        fontweight='bold',
-                        fontsize=10
-                    )
-
-
             ax_zoom.ticklabel_format(style='sci', axis='y', scilimits=(0, 0))
-            ax_zoom.set_title(simple_title(subject, session, task, "Task Isolation Window - Zoomed Beginning (bgin / bas+ / DIN3)"))
+            ax_zoom.set_title(simple_title(subject, session, task, "Task Isolation Window - Zoomed Beginning (bgin / bas+)"))
             ax_zoom.set_xlabel("Full Session Time (seconds)")
             ax_zoom.set_ylabel("Amplitude [mV]")
             ax_zoom.grid(True, alpha=0.3)
             handles, labels = ax_zoom.get_legend_handles_labels()
-            priority = ['Isolated Experimental Window', 'bgin', 'bas+', 'DIN3']
+            priority = ['Isolated Experimental Window', 'bgin', 'bas+']
             ordered = sorted(zip(handles, labels), key=lambda item: next((i for i, key in enumerate(priority) if item[1].startswith(key)), len(priority)))
             if ordered:
                 ordered_handles, ordered_labels = zip(*ordered)
@@ -3038,6 +3035,21 @@ def process_file(
             )
 
 
+        if poor_quality_excessive_removal:
+            summary_mean_rr = summary_min_rr = summary_max_rr = np.nan
+            summary_sdnn = summary_rmssd = np.nan
+            summary_mean_hr = summary_min_hr = summary_max_hr = summary_std_hr = np.nan
+        else:
+            summary_mean_rr = float(np.mean(rr_final_cleaned)) if len(rr_final_cleaned) else np.nan
+            summary_min_rr = float(np.min(rr_final_cleaned)) if len(rr_final_cleaned) else np.nan
+            summary_max_rr = float(np.max(rr_final_cleaned)) if len(rr_final_cleaned) else np.nan
+            summary_sdnn = float(sdnn) / 1000.0 if np.isfinite(sdnn) else np.nan
+            summary_rmssd = float(rmssd) / 1000.0 if np.isfinite(rmssd) else np.nan
+            summary_mean_hr = float(mean_hr) if np.isfinite(mean_hr) else np.nan
+            summary_min_hr = float(min_hr) if np.isfinite(min_hr) else np.nan
+            summary_max_hr = float(max_hr) if np.isfinite(max_hr) else np.nan
+            summary_std_hr = float(std_hr) if np.isfinite(std_hr) else np.nan
+
         # 21. RS summary CSV (metric/value format for Excel)
         summary_rows = [
             ('session_id', session.replace('ses-', '')),
@@ -3081,15 +3093,15 @@ def process_file(
             ('rr_20percent_filter_yield_pct', round(float(filter_yield_pct), 6)),
             # ('num_segments', int(len(onsets))),
             # ('total_usable_seconds', round(float(total_usable_seconds), 6)),
-            ('mean_rr_interval_sec', round(float(np.mean(rr_final_cleaned)) if len(rr_final_cleaned) > 0 else np.nan, 6)),
-            ('min_rr_interval_sec', round(float(np.min(rr_final_cleaned)) if len(rr_final_cleaned) > 0 else np.nan, 6)),
-            ('max_rr_interval_sec', round(float(np.max(rr_final_cleaned)) if len(rr_final_cleaned) > 0 else np.nan, 6)),
-            ('sdnn_rr_interval_sec', round(float(sdnn) / 1000.0, 6) if np.isfinite(sdnn) else np.nan),
-            ('rmssd_rr_interval_sec', round(float(rmssd) / 1000.0, 6) if np.isfinite(rmssd) else np.nan), 
-            ('mean_heart_rate_bpm', round(float(mean_hr), 6) if not np.isnan(mean_hr) else np.nan),
-            ('min_heart_rate_bpm', round(float(min_hr), 6) if not np.isnan(min_hr) else np.nan),
-            ('max_heart_rate_bpm', round(float(max_hr), 6) if not np.isnan(max_hr) else np.nan),
-            ('std_heart_rate_bpm', round(float(std_hr), 6) if not np.isnan(std_hr) else np.nan),
+            ('mean_rr_interval_sec', round(summary_mean_rr, 6) if np.isfinite(summary_mean_rr) else np.nan),
+            ('min_rr_interval_sec', round(summary_min_rr, 6) if np.isfinite(summary_min_rr) else np.nan),
+            ('max_rr_interval_sec', round(summary_max_rr, 6) if np.isfinite(summary_max_rr) else np.nan),
+            ('sdnn_rr_interval_sec', round(summary_sdnn, 6) if np.isfinite(summary_sdnn) else np.nan),
+            ('rmssd_rr_interval_sec', round(summary_rmssd, 6) if np.isfinite(summary_rmssd) else np.nan),
+            ('mean_heart_rate_bpm', round(summary_mean_hr, 6) if np.isfinite(summary_mean_hr) else np.nan),
+            ('min_heart_rate_bpm', round(summary_min_hr, 6) if np.isfinite(summary_min_hr) else np.nan),
+            ('max_heart_rate_bpm', round(summary_max_hr, 6) if np.isfinite(summary_max_hr) else np.nan),
+            ('std_heart_rate_bpm', round(summary_std_hr, 6) if np.isfinite(summary_std_hr) else np.nan),
 
             # ('start_marker_label', marker_start_label if marker_start_label is not None else ''),
             # ('start_marker_sec', round(float(marker_start_sec), 6) if marker_start_sec is not None else np.nan),
@@ -3097,6 +3109,23 @@ def process_file(
             # ('end_marker_sec', round(float(marker_end_sec), 6) if marker_end_sec is not None else np.nan),
         ]
         save_rs_summary_csv(csv_folder, title_base, summary_rows)
+
+        if poor_quality_excessive_removal:
+            keep_png_names = {
+                f"{title_base}_cleaned_rr_intervals.png",
+                f"{title_base}_filtered_task_window_isolated.png",
+                f"{title_base}_filtered_task_window_isolated_zoom.png",
+                f"{title_base}_Quality_Report.png",
+            }
+
+            for png_path in Path(png_folder).glob("*.png"):
+                if png_path.name not in keep_png_names:
+                    try:
+                        png_path.unlink()
+                    except Exception as exc:
+                        print(f"WARNING: could not remove {png_path.name}: {exc}")
+
+            print("Poor-quality file: retained only the 4 requested QC PNGs.")
 
         print(f"\n Finished: {filename}")
         print(f"Outputs saved in: {output_folder}")
@@ -3112,7 +3141,7 @@ def process_file(
 
         subject = f"sub-{config.participant_labels[0]}" if config.participant_labels else "unknown_subject"
         session = f"ses-{config.session_labels[0]}" if config.session_labels else "unknown_session"
-        log_path = Path(config.output_dir) / subject / session / "failed_files_log.txt"
+        log_path = Path(config.output_dir) / subject / session / "ecg" / "failed_files_log.txt"
         log_path.parent.mkdir(parents=True, exist_ok=True)
 
         with open(log_path, "a") as log:

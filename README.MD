@@ -101,6 +101,7 @@ Notes:
 - group_level is accepted for BIDS-App compatibility but does not perform group-level processing.
 - The pipeline uses task markers from events.tsv to define the analysis window, typically trimming from bas+ to TRSP.
 - If the ECG channel is not explicitly labeled as ECG/EKG in channels.tsv, the script will use the fallback channel name.
+- If more than 80% of the ECG data, R-peaks, or RR intervals are removed during quality control, the derived summary data are reported as `n/a` and the final processed ECG/RR derivative files are not exported. The requested QC plots are retained for review.
 
 ## Output structure
 
@@ -129,10 +130,12 @@ Typical output files include:
 
 - CSV files written to the `csv` subfolder, including summary CSVs and RR-filter details. The script writes a participant/task summary as:
   - `<title_base>_summary.csv`
+  - When the excessive-removal threshold is exceeded, affected summary metrics are written as `n/a`.
 
 - Raw/derived `.set` and other data artifacts are written to the `data` subfolder, for example:
   - `<title_base>_raw_bas_trsp.set`
   - `<title_base>_filtered_ecg.set`
+  - `<title_base>_final_processed_ecg.set` (this file will not be produced when more than 80% of the data are removed)
 
 - Participant/session-level logs (written alongside the participant folder):
   - `skipped_no_ecg_channel_log.txt` — created when no ECG channel is selected for a participant/session
