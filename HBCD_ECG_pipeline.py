@@ -3231,7 +3231,7 @@ def main() -> int:
     print(f"Files completed successfully: {total_files - failed_files}")
     print(f"Files failed/skipped: {failed_files}")
 
-    return 1 if failed_files else 0
+    return 1 if failed_files == total_files else 0
 
 
 if __name__ == "__main__":
